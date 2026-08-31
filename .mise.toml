@@ -1,0 +1,31 @@
+[tools]
+bun = "1"
+
+[tasks.typecheck]
+description = "Type-check all TypeScript"
+run = "bunx tsc --noEmit"
+
+[tasks.test]
+description = "Run the test suite"
+run = "bun test"
+
+[tasks.build]
+description = "Bundle the library entry point to dist/"
+run = "bun build src/index.ts --outdir dist --target bun"
+
+[tasks.lint]
+description = "Lint via the TypeScript type-checker"
+run = "bunx tsc --noEmit"
+
+# The gate: everything that needs nothing but a clean checkout and the toolchain
+# pinned above. CI calls this task rather than re-spelling its steps, so the gate
+# has one definition and a step added here reaches both at once.
+#
+# This file is written to be complete on its own, because it is one of the files
+# that travels to a published copy of this library. Tasks that only make sense
+# beside the private working notes live in `mise.local.toml`, which does not
+# travel and which mise merges into this one — so `mise tasks ls` here shows both
+# sets, and a published checkout shows only these.
+[tasks.ci]
+description = "The gate: type-check and the test suite"
+depends = ["typecheck", "test"]

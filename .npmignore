@@ -1,0 +1,61 @@
+# The second layer of what `npm pack` must never pick up. **The first layer is
+# the `files` allowlist in `package.json`, and it is the one that decides.**
+#
+# That ordering is the whole point. npm packs from the working tree, not from
+# git, and a clean git history says nothing about a file that was never
+# committed — it exists in a working directory, `npm pack` reads the working
+# directory, and a registry never takes a version back.
+#
+# A denylist cannot close that, because it fails *open* on the case nobody
+# thought of. The patterns below reach `server.env` and a stray `-wal` sidecar,
+# and they do not reach `id_rsa` (no extension to match), `.envrc` (dot-prefixed
+# but not `.env`, and this repository ships a flake that invites direnv),
+# `.netrc`, `.git-credentials` or a tool's dot-directory. A real `npm pack`
+# shipped every one of those while this file looked complete.
+#
+# `files` inverts it: npm treats it as an allowlist that outranks this file
+# entirely, so the tarball is what was named rather than everything that escaped
+# naming. This file stays because it costs nothing and because it still catches
+# junk that lands *inside* an allowlisted directory. It is no longer the control,
+# and it no longer ships with the package.
+
+# Dependencies and build output.
+node_modules/
+.bun/
+bun.lockb
+dist/
+build/
+
+# Databases. A test run leaves these behind, and the `-wal` and `-shm` sidecars
+# carry pages the `.sqlite` file itself does not.
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Environment files and keys. `.env` alone is not enough: an environment file is
+# very often named without a leading dot — `server.env`, `production.env` — and a
+# rule that only matches the dotted form walks straight past it. The suffix rule
+# below is the one that catches those, and `secrets/` is refused outright.
+.env
+.env.*
+*.env
+secrets/
+*.pem
+*.key
+
+# Logs, editor and OS leftovers.
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Development-only material. Present in some checkouts, useful to no consumer.
+# What actually makes packing from any checkout produce the same tarball is the
+# `files` allowlist, not this block — these are belt to its braces.
+docs/
+AGENTS.md
+OPEN_SOURCING_PROGRESS.md
+*.local.*

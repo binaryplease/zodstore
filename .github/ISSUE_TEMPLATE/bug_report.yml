@@ -1,0 +1,88 @@
+name: Bug report
+description: Something behaves differently from what the README or the types say
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The three things a report is usually missing are
+        the Bun version, the Zod version, and a reproduction small enough to
+        run — the fields below ask for exactly those.
+
+        **Do not report a security vulnerability here.** Use the Security tab →
+        *Report a vulnerability*, which is private. See `SECURITY.md`.
+
+  - type: textarea
+    id: what-happens
+    attributes:
+      label: What happens
+      description: The actual behaviour, including the full error and stack trace if there is one.
+      placeholder: |
+        `collection.find({ where: { ... } })` returns every row instead of the
+        two that match.
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: >
+        The smallest schema and sequence of calls that shows it. An in-memory
+        store (`createStore({ path: ":memory:" })`) is usually enough, and a
+        snippet someone can paste into a file and run is worth more than a
+        description of one.
+      render: typescript
+      placeholder: |
+        import { z } from "zod";
+        import { createStore } from "zodstore";
+
+        const store = createStore({ path: ":memory:" });
+        // ...
+    validations:
+      required: true
+
+  - type: input
+    id: bun-version
+    attributes:
+      label: Bun version
+      description: "`bun --version`"
+      placeholder: "1.3.13"
+    validations:
+      required: true
+
+  - type: input
+    id: zod-version
+    attributes:
+      label: Zod version
+      description: >
+        Zod is a peer dependency, so the version is yours, not the library's.
+        Both Zod 3 and Zod 4 are supported and they do differ.
+      placeholder: "4.4.3"
+    validations:
+      required: true
+
+  - type: input
+    id: library-version
+    attributes:
+      label: Library version or commit
+      placeholder: "0.3.1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: >
+        Whether the database is on disk or in memory, whether more than one
+        process or connection opens it, and anything else you think matters.
+    validations:
+      required: false

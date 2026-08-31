@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Bun
+bun.lockb
+.bun/
+
+# Build output
+dist/
+build/
+
+# SQLite database files
+*.sqlite
+*.sqlite3
+*.db
+
+# Logs
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Env
+.env
+.env.*
+!.env.example

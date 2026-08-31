@@ -1,0 +1,46 @@
+name: Feature request
+description: Something the library cannot express, or can only express awkwardly
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a deliberately small library, so the most useful thing you can
+        describe is the problem rather than the API you have in mind — often
+        there is already a way, and where there is not, the shape of the real
+        use case is what decides the design.
+
+        Two things that will be declined, so they are worth knowing up front:
+        a Node compatibility path (the library targets Bun and imports
+        `bun:sqlite`), and making Zod a hard dependency instead of a peer one.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The use case, not the proposed API.
+      placeholder: >
+        I need to find documents where a value in a nested array matches, and
+        the only way I found is to read the whole collection and filter in
+        TypeScript.
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: What you do today
+      description: The workaround, if you have one, and where it falls short.
+    validations:
+      required: false
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: >
+        Optional. If you have an API sketch, put it here — but the use case
+        above matters more.
+      render: typescript
+    validations:
+      required: false
