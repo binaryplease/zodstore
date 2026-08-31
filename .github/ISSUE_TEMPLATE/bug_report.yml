@@ -42,7 +42,7 @@ body:
       render: typescript
       placeholder: |
         import { z } from "zod";
-        import { createStore } from "zodstore";
+        import { createStore } from "@binaryplease/zodstore";
 
         const store = createStore({ path: ":memory:" });
         // ...

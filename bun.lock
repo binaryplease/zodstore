@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "zodstore",
+      "name": "@binaryplease/zodstore",
       "devDependencies": {
         "@types/bun": "^1.3.9",
         "typescript": "^5.7",

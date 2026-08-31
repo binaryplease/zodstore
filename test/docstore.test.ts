@@ -2925,7 +2925,12 @@ describe("the confidentiality guard", () => {
     };
     expect(manifest.license).toBe("MIT");
     expect(manifest.private).toBeUndefined();
-    expect(manifest.name).toBe("zodstore");
+    // Scoped, and that is load-bearing rather than cosmetic: the registry
+    // refused the bare name `zodstore` outright as too similar to an existing
+    // `zod-store`, so an unscoped manifest here is one that cannot be published
+    // at all. A scoped package is also restricted by default, which is why the
+    // publish step passes `--access public`.
+    expect(manifest.name).toBe("@binaryplease/zodstore");
     expect(manifest.repository?.url).toContain("/zodstore.git");
 
     // The published version is the one a reader of the changelog sees at the

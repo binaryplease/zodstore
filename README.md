@@ -32,10 +32,11 @@ Batched populate is the default join API:
 
 ## Install
 
-`zodstore` is a Bun-native library. Zod is a peer dependency, so install both:
+`@binaryplease/zodstore` is a Bun-native library. Zod is a peer dependency, so
+install both:
 
 ```bash
-bun add zodstore zod
+bun add @binaryplease/zodstore zod
 ```
 
 It imports `bun:sqlite`, so it runs under Bun only — not Node.
@@ -48,7 +49,7 @@ from. There is no build step to run and no `dist/` to configure.
 
 ```ts
 import { z } from "zod";
-import { createStore, populate, ref } from "zodstore";
+import { createStore, populate, ref } from "@binaryplease/zodstore";
 
 // Schemas are the single source of truth. Every non-identity field declares a
 // default so old rows read forward without migration.
@@ -595,8 +596,9 @@ not a public issue.
 ## Versioning
 
 Semantic versioning, with every release recorded in
-[`CHANGELOG.md`](CHANGELOG.md). Releases are published to npm as `zodstore`; the
-version in `package.json` is what a consumer pins against and compares.
+[`CHANGELOG.md`](CHANGELOG.md). Releases are published to npm as
+`@binaryplease/zodstore`; the version in `package.json` is what a consumer pins
+against and compares.
 
 ## License
 

@@ -6,7 +6,30 @@ Notable changes to `zodstore`, newest first. The format follows
 
 A version here is what a consumer pins and compares against: before `0.1.0` there
 was nothing to name, so "which docstore is this?" could only be answered by
-diffing trees (F008). Releases from `0.4.0` on are published to npm.
+diffing trees (F008). Releases from `0.4.2` on are published to npm as
+`@binaryplease/zodstore`.
+
+## 0.4.2 — 2026-08-31
+
+### Changed
+
+- **The package is now `@binaryplease/zodstore`.** The registry refused the
+  unscoped name outright — `403`, *"Package name too similar to existing package
+  zod-store"* — so the bare `zodstore` was never publishable, and no version was
+  ever published under it. Nothing about the library changes: the same modules,
+  the same exports, the same `src/index.ts` entry point. Only the specifier
+  moves.
+
+  ```bash
+  bun add @binaryplease/zodstore zod
+  ```
+
+  ```ts
+  import { createStore } from "@binaryplease/zodstore";
+  ```
+
+  A scoped package is restricted by default, so it publishes with
+  `--access public`. The repository keeps its own name and address.
 
 ## 0.4.1 — 2026-08-27
 
@@ -69,6 +92,10 @@ consumer installs neither.
 
 The package is named `zodstore` and is publishable. No behaviour changed — every
 export, option and default is exactly what `0.3.2` shipped.
+
+> **Superseded by `0.4.2`.** The unscoped name in this entry was never accepted
+> by the registry and no version was published under it. The specifier to import
+> is `@binaryplease/zodstore`.
 
 ### Changed
 
