@@ -9,7 +9,8 @@ import type { z } from "zod";
  * a `.default(...)` — and both rest on one question: which fields does this
  * schema declare? (The defaults rule asks it recursively, so this module also
  * answers the neighbouring one: what does a container declare its stored
- * *members* under — see `readContainedSchemas`.) Each guard used to answer it by reading `schema.shape` and
+ * *members* under — see `readContainedSchemas`.) Each guard used to answer it
+ * by reading `schema.shape` and
  * treating an absent `.shape` as "nothing to enforce". That is true of
  * `z.string()`; it is not true of `z.object({…}).transform(…)`, `.pipe()` or a
  * union, which have fields and no `.shape`, so both guards silently did nothing
@@ -72,6 +73,10 @@ interface SchemaDefinition {
   valueType?: unknown;
   /** The positional member schemas of a tuple, on both majors. */
   items?: unknown;
+  /** The schema a tuple's trailing positions are parsed against, on both majors. */
+  rest?: unknown;
+  /** The schema an object's undeclared keys are parsed against — `.catchall()`. */
+  catchall?: unknown;
 }
 
 /** A schema's definition object, or `undefined` for anything that is not one. */
@@ -176,14 +181,21 @@ export function readObjectShape(schema: unknown, depth = 0): SchemaShape {
  * One schema that a *stored member* of a container is parsed against, and how
  * that member is named in a field path.
  *
- * A container declares no fields of its own — `readObjectShape` answers `"none"`
- * for an array, a record and a tuple — but what it stores is parsed against a
- * declared schema all the same, so a rule about "what an already-stored value is
- * parsed against" reaches through it. The `kind` is what the caller renders the
- * path segment from; the reader does not spell paths.
+ * A container mostly declares no fields of its own — `readObjectShape` answers
+ * `"none"` for an array, a record and a tuple — but what it stores is parsed
+ * against a declared schema all the same, so a rule about "what an
+ * already-stored value is parsed against" reaches through it. An object with a
+ * `.catchall()` is both at once: it declares fields *and* stores members under a
+ * second schema, so it is read by both readers. The `kind` is what the caller
+ * renders the path segment from; the reader does not spell paths.
  */
 export interface ContainedSchema {
-  /** `element` for an array member, `item` for a tuple position, `value` for a record's values. */
+  /**
+   * `element` for an array member and for a tuple's `rest` tail, which is an
+   * array of the same shape; `item` for a declared tuple position; `value` for a
+   * record's values and for an object's `.catchall()` keys, both of which are
+   * keyed by the caller's data rather than by a declared name.
+   */
   kind: "element" | "item" | "value";
   /** The tuple position, and `null` for the kinds that have none. */
   position: number | null;
@@ -204,6 +216,12 @@ function schemaTag(definition: SchemaDefinition): string | undefined {
  * The schemas a container stores its members under, through whatever wrappers
  * the container carries (`z.array(…).default([])`), or `[]` for anything that is
  * not a container this library can read into.
+ *
+ * Every way a stored value reaches a schema *without* a declared field name is
+ * read here — an array's elements, a tuple's declared positions **and its `rest`
+ * tail**, a record's values, and an object's **`.catchall()`**. A shape missed
+ * here is a shape the defaults rule silently stops at, which is the failure this
+ * reader exists to end, so the set is enumerated rather than sampled.
  *
  * `z.map()` and `z.set()` are deliberately **not** read: neither survives the
  * JSON round-trip the write gate enforces, so no such field can reach storage in
@@ -230,7 +248,27 @@ export function readContainedSchemas(schema: unknown, depth = 0): ContainedSchem
     case "tuple":
     case "ZodTuple": {
       const items = Array.isArray(definition.items) ? definition.items : [];
-      return items.map((item, position) => ({ kind: "item" as const, position, schema: item }));
+      const contained: ContainedSchema[] = items.map((item, position) => ({
+        kind: "item",
+        position,
+        schema: item,
+      }));
+      // A `rest` is the tail past the declared positions — an array's worth of
+      // one shape, and stored exactly like one. Both majors leave it `null` when
+      // the tuple has none.
+      if (definition.rest !== undefined && definition.rest !== null) {
+        contained.push({ kind: "element", position: null, schema: definition.rest });
+      }
+      return contained;
+    }
+    case "object":
+    case "ZodObject": {
+      // An object's declared fields are `readObjectShape`'s to hold to the rule;
+      // what a `.catchall()` accepts under the keys it does *not* declare is
+      // stored the same way a record's values are. Zod 3 gives every object a
+      // `ZodNever` catchall, which declares nothing and costs one empty read.
+      const catchall = definition.catchall;
+      return catchall === undefined ? [] : [{ kind: "value", position: null, schema: catchall }];
     }
     default:
       break;

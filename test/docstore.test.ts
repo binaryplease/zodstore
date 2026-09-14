@@ -2737,17 +2737,34 @@ describe("the write gate", () => {
       ).toThrow(/field "meta\.id" has no default/);
     });
 
-    // A container declares no fields of its own, but what it *stores* is parsed
-    // against a declared schema, so an old row's array element or record value
-    // breaks on an added defaultless member exactly as a nested object does.
-    // The path names the container as the reader sees it (F048).
+    // A container mostly declares no fields of its own, but what it *stores* is
+    // parsed against a declared schema, so an old row's array element, tuple
+    // tail, record value or catchall key breaks on an added defaultless member
+    // exactly as a nested object does. Every way a stored value reaches a schema
+    // without a declared field name is enumerated here, because a shape missed
+    // is a shape the rule silently stops at — which is the whole of F048. The
+    // path names the container as the reader sees it.
     test("the walk reaches what an array, a tuple and a record store (F048)", () => {
       const store = createStore();
       const gapped = () => z.object({ name: z.string().default(""), color: z.string() });
       const containers: Array<{ path: string; member: z.ZodType }> = [
         { path: "holder[].color", member: z.array(gapped()).default([]) },
         { path: "holder[0].color", member: z.tuple([gapped()]).default([{ name: "", color: "" }]) },
+        // A tuple's `rest` tail stores an array's worth of one shape, and is a
+        // stored member the walk used to pass straight over.
+        {
+          path: "holder[].color",
+          member: z
+            .tuple([z.object({ name: z.string().default("") })], gapped())
+            .default([{ name: "" }]),
+        },
         { path: "holder.<key>.color", member: z.record(z.string(), gapped()).default({}) },
+        // A `.catchall()` is the other one: an object parses every key it does
+        // not declare against a second schema, and stores what it parsed.
+        {
+          path: "holder.<key>.color",
+          member: z.object({}).catchall(gapped()).default({}),
+        },
       ];
       for (const { path, member } of containers) {
         expect(
@@ -2757,23 +2774,101 @@ describe("the write gate", () => {
       }
       // The same containers with every member declared are accepted, so the
       // descent is into the gap and not into the container.
+      const sound = () => z.object({ name: z.string().default("") });
       expect(() =>
         store.collection(
           "sound",
           z.object({
             id: ref("c"),
-            tags: z.array(z.object({ name: z.string().default("") })).default([]),
-            byKey: z.record(z.string(), z.object({ name: z.string().default("") })).default({}),
+            tags: z.array(sound()).default([]),
+            byKey: z.record(z.string(), sound()).default({}),
+            tail: z.tuple([sound()], sound()).default([{ name: "" }]),
+            bag: z.object({}).catchall(sound()).default({}),
           }),
         ),
       ).not.toThrow();
-      // A container of scalars declares nothing to descend into.
+      // A container of scalars declares nothing to descend into, and neither
+      // does the catchall a caller writes to accept anything at all.
       expect(() =>
         store.collection(
           "scalars",
-          z.object({ id: ref("c"), tags: z.array(z.string()).default([]) }),
+          z.object({
+            id: ref("c"),
+            tags: z.array(z.string()).default([]),
+            loose: z.object({ k: z.string().default("") }).catchall(z.unknown()).default({ k: "" }),
+          }),
         ),
       ).not.toThrow();
+    });
+
+    // The reproduction of F048 in the two shapes that were still silent after
+    // the walk first went recursive: an old row whose catchall value — or whose
+    // tuple tail — was written under a schema the extension then made
+    // unreadable. Both are refused at collection() now, at the member's path.
+    test("a catchall value and a tuple tail cannot strand an old row either (F048)", () => {
+      const store = createStore();
+      const catchallV1 = z.object({
+        id: ref("d"),
+        bag: z
+          .object({})
+          .catchall(z.object({ a: z.string().default("") }))
+          .default({}),
+      });
+      store.collection("bags", catchallV1).insert({ id: "d_1", bag: { extra: { a: "y" } } });
+      const catchallV2 = z.object({
+        id: ref("d"),
+        bag: z
+          .object({})
+          .catchall(z.object({ a: z.string().default(""), gap: z.number() }))
+          .default({}),
+      });
+      expect(() => store.collection("bags", catchallV2)).toThrow(
+        /field "bag\.<key>\.gap" has no default/,
+      );
+      // The row the refusal protects: with the rule off, it no longer reads.
+      expect(() =>
+        store.collection("bags", catchallV2, { enforceDefaults: false }).get("d_1"),
+      ).toThrow(/does not match the current schema/);
+
+      // An object that declares fields *and* a catchall is read as both: the
+      // declared members pass here, and the gap is found under the catchall.
+      expect(() =>
+        store.collection(
+          "mixedBags",
+          z.object({
+            id: ref("d"),
+            bag: z
+              .object({
+                k: z
+                  .object({ a: z.string().default(""), gap: z.number().default(0) })
+                  .default({ a: "", gap: 0 }),
+              })
+              .catchall(z.object({ a: z.string().default(""), gap: z.number() }))
+              .default({ k: { a: "", gap: 0 } }),
+          }),
+        ),
+      ).toThrow(/field "bag\.<key>\.gap" has no default/);
+
+      const tupleV1 = z.object({
+        id: ref("p"),
+        pair: z
+          .tuple([z.object({ a: z.string().default("") })], z.object({ a: z.string().default("") }))
+          .default([{ a: "" }]),
+      });
+      store.collection("pairs", tupleV1).insert({ id: "p_1", pair: [{ a: "x" }, { a: "y" }] });
+      const tupleV2 = z.object({
+        id: ref("p"),
+        pair: z
+          .tuple(
+            [z.object({ a: z.string().default("") })],
+            z.object({ a: z.string().default(""), gap: z.number() }),
+          )
+          .default([{ a: "" }]),
+      });
+      expect(() => store.collection("pairs", tupleV2)).toThrow(/field "pair\[\]\.gap" has no default/);
+      expect(() =>
+        store.collection("pairs", tupleV2, { enforceDefaults: false }).get("p_1"),
+      ).toThrow(/does not match the current schema/);
     });
 
     // A container is read through each peer major's internals — Zod 4 keeps an
@@ -2802,8 +2897,24 @@ describe("the write gate", () => {
           member: zodThree.tuple([legacyGapped()]).default([{ color: "" }]),
         },
         {
+          // Zod 3 spells a tuple's tail `.rest(…)` rather than as a second
+          // argument, and keeps it under the same `rest` key Zod 4 uses.
+          path: "holder[].color",
+          member: zodThree
+            .tuple([zodThree.object({ name: zodThree.string().default("") })])
+            .rest(legacyGapped())
+            .default([{}]),
+        },
+        {
           path: "holder.<key>.color",
           member: zodThree.record(zodThree.string(), legacyGapped()).default({}),
+        },
+        {
+          // Every Zod 3 object carries a catchall — `ZodNever` unless one is
+          // declared — so the reader has to tell "no catchall" from one that
+          // stores members, on the major where the key is always present.
+          path: "holder.<key>.color",
+          member: zodThree.object({}).catchall(legacyGapped()).default({}),
         },
       ];
       for (const { path, member } of legacyContainers) {
@@ -2940,6 +3051,26 @@ describe("the write gate", () => {
       const schema = z.object({ id: ref("x"), nested: nested.default({} as never) });
       expect(() => store.collection("towers", schema)).toThrow(/nests more than \d+ levels deep/);
       expect(() => store.collection("towers", schema, { enforceDefaults: false })).not.toThrow();
+
+      // The case the bound exists for, rather than a hand-built tower: a
+      // `z.lazy()` whose body *builds* the object returns a fresh shape on every
+      // call, so the memo never recognises it. It is refused in milliseconds at
+      // the bound — where the same schema with the `lazy` around the reference
+      // (`children: z.lazy(() => z.array(Node))`, above) is walked once and
+      // accepted. That difference is the caller's to know, so it is in README.md.
+      const FreshEachCall: z.ZodType = z.lazy(() =>
+        z.object({
+          id: ref("n"),
+          name: z.string().default(""),
+          kids: z.array(FreshEachCall).default([]),
+        }),
+      );
+      expect(() =>
+        store.collection(
+          "nodes",
+          z.object({ id: ref("n"), root: z.array(FreshEachCall).default([]) }),
+        ),
+      ).toThrow(/nests more than \d+ levels deep/);
     });
 
     test("the check is escapable and skips a non-object schema", () => {

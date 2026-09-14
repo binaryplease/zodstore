@@ -38,10 +38,12 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
   schema was written. No fixture could have caught it, because every test row is
   written under the current schema.
 
-  The walk now recurses into every declared field and into what a container
-  *stores* — an array's elements, a tuple's positions, a record's values — and
-  names the full path (`settings.fontSize`, `tags[].color`, `prefs.<key>.size`)
-  rather than the leaf. A `ref()` stays exempt at any depth; `idField` exempts
+  The walk now recurses into every declared field and into every value a schema
+  stores *without* a declared field name — an array's elements, a tuple's declared
+  positions and its `rest` tail, a record's values, an object's `.catchall()` keys
+  — and names the full path (`settings.fontSize`, `tags[].color`,
+  `prefs.<key>.size`, `bag.<key>.size`) rather than the leaf. A `ref()` stays
+  exempt at any depth; `idField` exempts
   only at the top level, because that name is the column the rows are keyed by, so
   a nested `id` is an ordinary field. A nested union or intersection is refused
   naming the field, on the same terms a top-level one already was. Where the walk
@@ -49,7 +51,11 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
   comment: at a shape already walked (which is what terminates a self-referential
   schema), at the contents of a `z.map()` or `z.set()` (neither survives the write
   gate's JSON round-trip, so no such field reaches storage at all), and at ten
-  levels of nesting, which is refused rather than skipped.
+  levels of nesting, which is refused rather than skipped — which is where a
+  `z.lazy(() => z.object({…}))` lands, because a body that *builds* the object
+  returns a fresh shape per call. Put the `lazy` around the reference
+  (`children: z.lazy(() => z.array(Node))`) and the walk sees one shape; `README.md`
+  shows both spellings.
 
   This **refuses schemas that opened cleanly before**: a nested optional without a
   default now throws at `store.collection(...)`. That is the point — the row it

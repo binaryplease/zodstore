@@ -680,12 +680,13 @@ function assertDefaultsDeclared(
  * the dotted field path this schema sits at, and `""` is the collection's own
  * schema.
  *
- * **Where it descends.** Into every declared field, and into what a container
- * stores — an array's elements, a tuple's positions, a record's values — because
- * each of those is a schema an *already-stored* value is parsed against, which
- * is the whole of what the rule is about. The wrappers around either are
- * followed by the readers in `schema-shape.ts`, so `.default()`, `.transform()`
- * and `z.lazy()` do not hide a shape from the walk.
+ * **Where it descends.** Into every declared field, and into every value a
+ * schema stores *without* a declared field name — an array's elements, a tuple's
+ * positions and its `rest` tail, a record's values, an object's `.catchall()`
+ * keys — because each of those is a schema an *already-stored* value is parsed
+ * against, which is the whole of what the rule is about. The wrappers around
+ * either are followed by the readers in `schema-shape.ts`, so `.default()`,
+ * `.transform()` and `z.lazy()` do not hide a shape from the walk.
  *
  * **What is exempt.** `isReference` at any depth: a foreign key is
  * identity-shaped wherever it sits. `idField` **only at the top level**, because
@@ -734,20 +735,37 @@ function assertSchemaDefaults(
     );
   }
 
-  // A schema that declares no fields of its own may still *store* documents —
-  // an array of objects, a record of them — and a stored member is parsed
-  // against its schema exactly as a stored field is.
-  if (reading.kind === "none") {
-    for (const contained of readContainedSchemas(schema)) {
-      assertSchemaDefaults(contained.schema, containedPath(path, contained), walk, depth + 1);
-    }
-    return;
+  if (reading.kind === "declared") {
+    // The memo covers this shape's containers as well as its fields: a
+    // `.catchall()` belongs to the shape that declares it, and was walked with
+    // it, so a shape reached twice stops here rather than descending again.
+    if (walk.walkedShapes.has(reading.shape)) return;
+    if (path !== "") walk.walkedShapes.add(reading.shape);
+    assertDeclaredFieldDefaults(reading.shape, path, walk, depth);
   }
 
-  if (walk.walkedShapes.has(reading.shape)) return;
-  if (path !== "") walk.walkedShapes.add(reading.shape);
+  // A schema also stores values a declared field name never reaches — an array's
+  // elements, a tuple's positions and `rest` tail, a record's values, an
+  // object's `.catchall()` keys — and each of those is parsed against a schema
+  // exactly as a stored field is. An object is both at once, which is why this
+  // runs for a declared shape as well as for one that declares no fields.
+  for (const contained of readContainedSchemas(schema)) {
+    assertSchemaDefaults(contained.schema, containedPath(path, contained), walk, depth + 1);
+  }
+}
 
-  for (const [fieldName, fieldSchema] of Object.entries(reading.shape)) {
+/**
+ * Hold every field one shape declares to the rule, and descend into each. Split
+ * out so the container descent in `assertSchemaDefaults` reads as the separate
+ * question it is: a `.catchall()` object answers both.
+ */
+function assertDeclaredFieldDefaults(
+  shape: Record<string, z.ZodType>,
+  path: string,
+  walk: DefaultsWalk,
+  depth: number,
+): void {
+  for (const [fieldName, fieldSchema] of Object.entries(shape)) {
     if (path === "" && fieldName === walk.idField) continue;
     if (isReference(fieldSchema)) continue;
     const fieldPath = path === "" ? fieldName : `${path}.${fieldName}`;
