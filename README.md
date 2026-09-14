@@ -269,6 +269,30 @@ The three-level bound is a compile-time budget, not a runtime one: deeper paths 
 work through `compileWhere`/`jsonExtract` directly, they are simply not offered by the
 typed surface, where unbounded recursion would blow TypeScript's instantiation limit.
 
+### Index names and redefinition
+
+An index is named after its field list alone — `idx_<table>_<fields>`, with a literal
+`_` doubled, a `.` written `_dot_` and `_and_` between two fields, so no two field lists
+can produce one name. `["status"]` is `idx_notes_status`; `["address.city"]` is
+`idx_places_address_dot_city`. The name is a pure function of the fields, so reopening a
+collection with a declaration it already carries creates nothing.
+
+`unique` is deliberately not part of the name, so declaring the same fields once
+non-unique and once unique is a **redefinition, and it throws**:
+
+```ts
+store.collection("things", schema, { indexes: ["email"] });
+store.collection("things", schema, { indexes: [{ fields: ["email"], unique: true }] });
+// throws: index "idx_things_email" over (email) already exists as a non-unique index …
+//         Run DROP INDEX "main"."idx_things_email" and reopen if the change is intended.
+```
+
+Dropping a UNIQUE index takes away a constraint the application may still believe it
+has, and adding one can fail against rows already stored; neither is decided quietly on
+the caller's behalf. An index a version up to `0.4.2` wrote under the older, lossy name
+is adopted on the next open — recreated under the current name, then dropped — so an
+existing file ends up with one index per declaration and no migration to run.
+
 ### `OR` and `NOT`
 
 Sibling keys of a `where` are joined with `AND`. Two reserved keys combine clauses

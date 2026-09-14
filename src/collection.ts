@@ -57,6 +57,24 @@ export interface CollectionOptions {
    * ones and keeps the old, because a reopen with an extended schema is a
    * supported path and its new field may want an index. Only `idField` is
    * pinned on reopen.
+   *
+   * An index is named after its field list alone, encoded so that no two
+   * distinct lists can produce one name (`_` doubles, `.` becomes `_dot_`, and
+   * `_and_` separates two fields). Declaring `"a.b"` and `"a_b"` on one table
+   * therefore creates two indexes, where up to `0.4.2` they shared a name and
+   * the second declaration was a silent no-op. The name is a pure function of the
+   * fields, so reopening with the same declaration is still a no-op — that is
+   * what makes reopening cheap. An index a version up to 0.4.2 wrote under the
+   * old name is adopted on the next open: recreated under the new name and then
+   * dropped, so the file carries one index per declaration rather than two.
+   *
+   * `unique` is deliberately **not** part of the name, so declaring the same
+   * fields once non-unique and once unique collides — and that redefinition is
+   * **refused loudly**, with a throw naming the `DROP INDEX` that accepts it.
+   * Reconciling it silently is not on offer either way round: dropping a UNIQUE
+   * index takes away a constraint the application may still believe it has, and
+   * adding one can fail against rows already stored. Both are the caller's
+   * decision, not this library's.
    */
   indexes?: IndexInput[];
   /**
@@ -358,9 +376,230 @@ function normalizeIndex(index: IndexInput): IndexDefinition {
   return { fields: index.fields, unique: index.unique ?? false };
 }
 
-function indexName(tableName: string, fields: string[]): string {
+/**
+ * Encode one field path into the identifier charset without losing information:
+ * a literal underscore doubles, and a dot becomes `_dot_`. Every underscore in
+ * the output therefore opens an escape — `__` for a literal one, `_dot_` for a
+ * path separator, `_and_` for the gap between two fields — so the encoding can
+ * be read back and no two distinct field lists can produce one string.
+ *
+ * That injectivity is the whole point (F043, #6). The previous encoding replaced a dot
+ * with an underscore, which mapped the distinct paths `a.b` and `a_b` onto one
+ * name, and `CREATE INDEX IF NOT EXISTS` keys on the name alone — so the second
+ * declaration was a silent no-op, taking a declared `unique` with it.
+ */
+function encodeIndexPath(fieldPath: string): string {
+  return fieldPath.replace(/_/g, "__").replace(/\./g, "_dot_");
+}
+
+/**
+ * The name an index carries, derived from its field list and nothing else.
+ *
+ * `unique` is deliberately absent: the flag not being part of the name is what
+ * makes a redefinition — the same fields declared once non-unique and once
+ * unique — collide here and get refused loudly, rather than quietly becoming two
+ * indexes over one expression. The name stays a pure function of the fields, so
+ * reopening a collection with the same declaration finds the same index, which
+ * is what makes a reopen cheap.
+ *
+ * Every character comes from a validated source: `tableName` has passed
+ * `assertIdentifier` and each field path has passed `jsonExtract`'s path
+ * pattern, so the result is `[A-Za-z0-9_]` only and carries nothing a caller
+ * chose the shape of — this name is interpolated into SQL text, where an index
+ * name cannot be bound.
+ */
+function indexName(tableName: string, fields: readonly string[]): string {
+  return `idx_${tableName}_${fields.map(encodeIndexPath).join("_and_")}`;
+}
+
+/**
+ * The name this index carried before the encoding above was injective. Written
+ * by versions up to 0.4.2, so a file created by one already holds indexes under
+ * it: on the next open an index found under this name over the same expression
+ * is the same index, and is adopted rather than duplicated.
+ *
+ * For a single field with neither a dot nor an underscore the two names are
+ * equal — the common case, where nothing moves.
+ */
+function supersededIndexName(tableName: string, fields: readonly string[]): string {
   const suffix = fields.map((field) => field.replace(/\./g, "_")).join("_");
   return `idx_${tableName}_${suffix}`;
+}
+
+/** An index already on the table, as far as its stored `CREATE` text says. */
+interface ExistingIndex {
+  readonly unique: boolean;
+  /**
+   * The parenthesised expression list it indexes, or `null` for a `CREATE`
+   * this library did not write and cannot compare against a declaration.
+   */
+  readonly expressions: string | null;
+}
+
+/**
+ * Split a stored `CREATE INDEX` back into the two things a declaration is
+ * compared against. SQLite keeps the statement text verbatim apart from
+ * dropping `IF NOT EXISTS` and the database qualifier, and every index this
+ * library writes ends in its expression list, so the comparison is against text
+ * this same function generated.
+ */
+const CREATE_INDEX_PATTERN = /^CREATE\s+(UNIQUE\s+)?INDEX\b[\s\S]*?\(([\s\S]*)\)\s*;?\s*$/i;
+
+/**
+ * One index declaration, resolved against what the table already carries:
+ * validated, named, and reduced to the statements the open has to run.
+ */
+interface ResolvedIndex {
+  readonly name: string;
+  readonly fields: readonly string[];
+  readonly unique: boolean;
+  /** The `json_extract` list, already path-checked. */
+  readonly expressions: string;
+  /** False when an equivalent index is already on the table. */
+  readonly create: boolean;
+  /** An equivalent index under the superseded name, to drop once this exists. */
+  readonly supersedes: string | null;
+}
+
+/** Every index currently on one table, keyed by name. */
+function readExistingIndexes(
+  database: Database,
+  databaseName: string,
+  tableName: string,
+): Map<string, ExistingIndex> {
+  // The table name travels as a bound value, not as an identifier: this reads
+  // the catalogue rather than the table, so nothing about it has to reach the
+  // SQL text. `sql IS NULL` is an index SQLite made itself (the primary key's),
+  // which no declaration can collide with.
+  const rows = database
+    .query(
+      `SELECT name, sql FROM "${databaseName}".sqlite_master ` +
+        `WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL`,
+    )
+    .all(tableName) as Array<{ name: string; sql: string }>;
+  const existing = new Map<string, ExistingIndex>();
+  for (const row of rows) {
+    const parsed = CREATE_INDEX_PATTERN.exec(row.sql);
+    existing.set(row.name, {
+      unique: parsed !== null && parsed[1] !== undefined,
+      expressions: parsed?.[2] ?? null,
+    });
+  }
+  return existing;
+}
+
+function describeUniqueness(unique: boolean): string {
+  return unique ? "unique" : "non-unique";
+}
+
+/**
+ * Refuse a redefinition of an index that is already on the table. This is the
+ * deliberate half of F043 (#6): the silent no-op also covered a *genuine* change of
+ * mind, and an index is not redefined in place — dropping a UNIQUE takes away a
+ * constraint the application may still believe in, and adding one can fail
+ * against rows already stored. Both are the caller's call, so the throw names
+ * the statement that makes it.
+ */
+function refuseIndexRedefinition(
+  collectionName: string,
+  databaseName: string,
+  existingName: string,
+  existingUnique: boolean,
+  fields: readonly string[],
+  unique: boolean,
+): never {
+  throw new Error(
+    `collection("${collectionName}"): index "${existingName}" over ` +
+      `(${fields.join(", ")}) already exists as a ${describeUniqueness(existingUnique)} ` +
+      `index, and this call declares it ${describeUniqueness(unique)}. An index is not ` +
+      `redefined in place: dropping a UNIQUE takes a constraint with it, and adding one ` +
+      `can fail against rows already stored. Run ` +
+      `DROP INDEX "${databaseName}"."${existingName}" and reopen if the change is intended.`,
+  );
+}
+
+/**
+ * Validate every index declaration and resolve it against the table's current
+ * indexes. Reads the catalogue, writes nothing and records nothing: every throw
+ * a bad or conflicting declaration causes happens here, above `bindTable` and
+ * above the first statement of the open (F045, #8).
+ */
+function resolveIndexes(
+  database: Database,
+  databaseName: string,
+  tableName: string,
+  declarations: readonly IndexInput[],
+): ResolvedIndex[] {
+  if (declarations.length === 0) return [];
+  const existing = readExistingIndexes(database, databaseName, tableName);
+  const resolved = new Map<string, ResolvedIndex>();
+  for (const declaration of declarations) {
+    const { fields, unique = false } = normalizeIndex(declaration);
+    if (fields.length === 0) {
+      throw new Error(
+        `collection("${tableName}"): an index declaration names no fields. ` +
+          `An index is over at least one field path.`,
+      );
+    }
+    // Path-checked first, so the name below is derived from validated paths.
+    const expressions = fields.map((field) => jsonExtract(field)).join(", ");
+    const name = indexName(tableName, fields);
+
+    const declaredTwice = resolved.get(name);
+    if (declaredTwice !== undefined) {
+      if (declaredTwice.unique !== unique) {
+        throw new Error(
+          `collection("${tableName}"): indexes declares (${fields.join(", ")}) twice, ` +
+            `once ${describeUniqueness(declaredTwice.unique)} and once ` +
+            `${describeUniqueness(unique)}. One field list is one index; declare it once.`,
+        );
+      }
+      continue;
+    }
+
+    const current = existing.get(name);
+    if (current !== undefined) {
+      if (current.expressions !== expressions) {
+        throw new Error(
+          `collection("${tableName}"): an index named "${name}" already exists on this ` +
+            `table over a different expression, so the index declared over ` +
+            `(${fields.join(", ")}) cannot be created under the name derived for it. ` +
+            `Drop or rename that index and reopen.`,
+        );
+      }
+      if (current.unique !== unique) {
+        refuseIndexRedefinition(tableName, databaseName, name, current.unique, fields, unique);
+      }
+    }
+
+    // An index this declaration wrote under the superseded name is the same
+    // index: same expression list, same table. Adopt it — the open creates the
+    // one under the injective name and drops that one — rather than leaving the
+    // file carrying two indexes over one expression.
+    const supersededName = supersededIndexName(tableName, fields);
+    const superseded = supersededName === name ? undefined : existing.get(supersededName);
+    const supersedesThis = superseded !== undefined && superseded.expressions === expressions;
+    if (supersedesThis && superseded.unique !== unique) {
+      refuseIndexRedefinition(
+        tableName,
+        databaseName,
+        supersededName,
+        superseded.unique,
+        fields,
+        unique,
+      );
+    }
+
+    resolved.set(name, {
+      name,
+      fields,
+      unique,
+      expressions,
+      create: current === undefined,
+      supersedes: supersedesThis ? supersededName : null,
+    });
+  }
+  return [...resolved.values()];
 }
 
 /** How many paths or issues an error message names before it stops listing. */
@@ -818,23 +1057,75 @@ export function createQualifiedCollection<TSchema extends z.ZodType>(
   schema: TSchema,
   options: CollectionOptions = {},
 ): Collection<z.input<TSchema>, z.output<TSchema>> {
-  type TInput = z.input<TSchema>;
-  type TDocument = z.output<TSchema>;
+  // Resolving the options is the whole validation phase, and it is a separate
+  // call so the ordering holds structurally rather than by line order (F045,
+  // #8): the body below never sees `options`, so an option added later is
+  // unreachable until it is resolved here — above the binding, above the first
+  // statement.
+  return openResolvedCollection(
+    database,
+    databaseName,
+    name,
+    schema,
+    resolveCollectionOptions(database, databaseName, name, schema, options),
+  );
+}
 
+/** Every option of a collection, validated and reduced to what the open runs on. */
+interface ResolvedCollectionOptions {
+  readonly idField: string;
+  readonly maxRows: number | null;
+  readonly onParseError: ParseErrorPolicy;
+  readonly indexes: readonly ResolvedIndex[];
+}
+
+/**
+ * Validate every option and resolve it to the form the collection is opened
+ * with. This function records no process state and emits no statement: it reads
+ * the catalogue and it throws, and nothing else. That is what makes the
+ * invariant `openResolvedCollection` states true — a call that fails on any
+ * option, `indexes` included, leaves no binding, no table and no index behind.
+ */
+function resolveCollectionOptions(
+  database: Database,
+  databaseName: string,
+  name: string,
+  schema: z.ZodType,
+  options: CollectionOptions,
+): ResolvedCollectionOptions {
   // The database name is generated (`main`, `store_1`, …) rather than supplied,
-  // but it is interpolated into every statement below, so it is held to the same
-  // identifier rule as everything else that reaches the SQL text.
+  // but it is interpolated into every statement of the open, so it is held to
+  // the same identifier rule as everything else that reaches the SQL text.
   assertIdentifier(databaseName, "database name");
   assertIdentifier(name, "collection name");
   const idField = options.idField ?? "id";
   assertIdentifier(idField, "id field");
   assertNoReservedFieldNames(schema, name, idField);
   if (options.enforceDefaults ?? true) assertDefaultsDeclared(schema, name, idField);
-  const maxRows = resolveMaxRows(options.maxRows);
-  const onParseError: ParseErrorPolicy = options.onParseError ?? "throw";
+  return {
+    idField,
+    maxRows: resolveMaxRows(options.maxRows),
+    onParseError: options.onParseError ?? "throw",
+    indexes: resolveIndexes(database, databaseName, name, options.indexes ?? []),
+  };
+}
+
+function openResolvedCollection<TSchema extends z.ZodType>(
+  database: Database,
+  databaseName: string,
+  name: string,
+  schema: TSchema,
+  resolvedOptions: ResolvedCollectionOptions,
+): Collection<z.input<TSchema>, z.output<TSchema>> {
+  type TInput = z.input<TSchema>;
+  type TDocument = z.output<TSchema>;
+
+  const { idField, maxRows, onParseError } = resolvedOptions;
   // Every option is validated before the first statement runs, so a bad one
   // never leaves a table behind — and the reopen conflict is refused before it
-  // can add an index or a row under the wrong identity convention.
+  // can add an index or a row under the wrong identity convention. The
+  // validation is `resolveCollectionOptions`, upstream of this function, so the
+  // guarantee is structural: nothing reachable from here can throw on an option.
   bindTable(database, databaseName, name, idField);
 
   const quotedTable = `"${databaseName}"."${name}"`;
@@ -843,16 +1134,23 @@ export function createQualifiedCollection<TSchema extends z.ZodType>(
     `CREATE TABLE IF NOT EXISTS ${quotedTable} (id TEXT PRIMARY KEY, doc TEXT NOT NULL)`,
   );
 
-  for (const index of options.indexes ?? []) {
-    const { fields, unique } = normalizeIndex(index);
-    const expressions = fields.map(jsonExtract).join(", ");
-    const uniqueKeyword = unique ? "UNIQUE " : "";
-    // SQLite qualifies an index by its *own* name — `CREATE INDEX db.idx ON
-    // table` — and resolves the table in that same database; a qualified table
-    // name here is a syntax error rather than the obvious spelling.
-    database.run(
-      `CREATE ${uniqueKeyword}INDEX IF NOT EXISTS "${databaseName}"."${indexName(name, fields)}" ON "${name}" (${expressions})`,
-    );
+  for (const index of resolvedOptions.indexes) {
+    if (index.create) {
+      const uniqueKeyword = index.unique ? "UNIQUE " : "";
+      // SQLite qualifies an index by its *own* name — `CREATE INDEX db.idx ON
+      // table` — and resolves the table in that same database; a qualified table
+      // name here is a syntax error rather than the obvious spelling.
+      database.run(
+        `CREATE ${uniqueKeyword}INDEX IF NOT EXISTS "${databaseName}"."${index.name}" ON "${name}" (${index.expressions})`,
+      );
+    }
+    // Dropped only after the replacement exists: a process that dies between the
+    // two leaves a duplicate index the next open clears, where the other order
+    // would leave the table with neither — and, for a UNIQUE one, with no
+    // constraint.
+    if (index.supersedes !== null) {
+      database.run(`DROP INDEX IF EXISTS "${databaseName}"."${index.supersedes}"`);
+    }
   }
 
   // Cached statements — bun:sqlite reuses the underlying prepared statement.

@@ -13,6 +13,83 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
 
 ### Fixed
 
+- **Two index declarations can no longer collapse onto one name, silently
+  dropping a UNIQUE.** The index name replaced every `.` in a field path with
+  `_`, so the distinct paths `a.b` and `a_b` produced one name — and the
+  statement it feeds is `CREATE … INDEX IF NOT EXISTS`, which keys on the name
+  alone: it compares neither the indexed expression nor the uniqueness. The
+  second declaration was a no-op with no diagnostic, so a `unique: true` index
+  was never created and the collection accepted the duplicate row it was declared
+  to refuse (F043, [#6](https://github.com/binaryplease/zodstore/issues/6)).
+
+  ```ts
+  store.collection("things", schema, { indexes: ["a.b"] });
+  store.collection("things", schema, { indexes: [{ fields: ["a_b"], unique: true }] });
+  // was: one index, idx_things_a_b, non-unique, over $.a.b — the duplicate lands
+  // now: idx_things_a_dot_b over $.a.b, and UNIQUE idx_things_a__b over $.a_b
+  ```
+
+  The name is now derived through an encoding that loses nothing — a literal `_`
+  doubles, a `.` becomes `_dot_`, and `_and_` separates two fields — so no two
+  field lists can produce one name. It stays a pure function of the fields, so
+  reopening a collection with the same declaration still creates exactly one
+  index. A single field with neither a `.` nor a `_` — `["status"]` — is spelled
+  exactly as before.
+
+- **A redefinition of an index is now refused loudly instead of ignored.** The
+  same silent no-op also covered a genuine change of mind: the same fields
+  declared once non-unique and once unique. `unique` is deliberately not part of
+  the name, so the redefinition collides and throws, naming the `DROP INDEX` that
+  accepts it. Reconciling it silently is not on offer in either direction —
+  dropping a UNIQUE index takes away a constraint the application may still
+  believe it has, and adding one can fail against rows already stored, so both
+  are the caller's decision (F043). An index declaration naming no fields, which
+  used to reach SQLite as a syntax error after the table had been created, is
+  refused at the edge for the same reason.
+
+- **A file written by an earlier version keeps one index per declaration.** An
+  index found under the name versions up to `0.4.2` wrote, over the same
+  expression, is the same
+  index: the open creates it under the new name and then drops the old one, in
+  that order, so a process that dies between the two leaves a duplicate the next
+  open clears rather than a table with no index and — for a UNIQUE one — no
+  constraint. An index under that name over a *different* expression is left
+  alone, because it is an index an earlier run declared and cumulative indexes
+  are the documented behaviour. Nothing here is a migration a caller has to run.
+
+  One consequence to expect on an existing file: a `unique: true` declaration
+  that was silently dropped by the collision above is now *created*, so if
+  duplicate rows landed while the constraint was missing, the open fails with
+  SQLite's `UNIQUE constraint failed`. That is the defect surfacing where it can
+  be acted on — the alternative is a collection that keeps reporting a constraint
+  it does not have. Remove the duplicates, or drop the `unique` flag from the
+  declaration.
+
+- **A `collection()` call that fails on an option no longer poisons the
+  connection.** `bindTable` recorded the table's identity convention before the
+  `indexes` option was validated — its field paths were path-checked inside the
+  loop that creates them, below the binding and below `CREATE TABLE` — and
+  `TABLE_BINDINGS` is keyed on the `Database`, so a binding left by a call that
+  then threw outlived that call for the life of the connection. A typo in an
+  index path therefore made the *corrected* retry with a different `idField` fail
+  permanently, against an identity convention no successful call ever established
+  (F045, [#8](https://github.com/binaryplease/zodstore/issues/8)).
+
+  ```ts
+  store.collection("t", Schema, { idField: "userId", indexes: ["bad path!"] });
+  // throws: Invalid field path "bad path!"
+  store.collection("t", OtherSchema);
+  // was: throws: already open with idField "userId", cannot reopen with "id"
+  // now: opens — the failed call left no binding, and no table either
+  ```
+
+  Every option is now validated and resolved in one step upstream of the open,
+  which never sees the raw options: the ordering the comment at that binding
+  asserts holds structurally rather than by line order, so an option added later
+  is unreachable until it is validated there too. The F013 guard is unchanged —
+  two *successful* opens with conflicting `idField`s are still refused, including
+  the case-variant spelling.
+
 - **An `in`/`notIn` list no longer retains a prepared statement per distinct
   length.** The element *count* was part of the SQL text — `in` over three values
   and `in` over four were two statements — and `bun:sqlite` caches one prepared

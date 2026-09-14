@@ -2210,6 +2210,243 @@ describe("collection reopen bindings (F013)", () => {
     expect(indexNames).toContain("idx_notes_status");
     expect(indexNames).toContain("idx_notes_owner");
   });
+
+  // F045 — `bindTable` records the binding for the life of the connection, so a
+  // call that threw *after* it left the F013 guard describing an identity
+  // convention no successful call ever established, and the corrected retry was
+  // refused permanently.
+  test("a call that fails on an option leaves no binding and no table (F045)", () => {
+    const store = createStore();
+    const tableExists = (name: string): boolean =>
+      store.database
+        .query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
+        .all(name).length > 0;
+
+    // The reported arm: `indexes` is the option whose validation used to run
+    // below the binding, inside the loop that creates the indexes.
+    expect(() =>
+      store.collection(
+        "t",
+        z.object({ userId: z.string(), name: z.string().default("") }),
+        { idField: "userId", indexes: ["bad path!"] },
+      ),
+    ).toThrow(/Invalid field path "bad path!"/);
+    expect(tableExists("t")).toBe(false);
+
+    // The assertion is about the invariant, not about `indexes`: any option that
+    // fails has to leave the same nothing behind.
+    expect(() =>
+      store.collection("t", z.object({ userId: z.string(), name: z.string().default("") }), {
+        idField: "userId",
+        maxRows: 0,
+      }),
+    ).toThrow("Invalid maxRows 0");
+    expect(() =>
+      store.collection("t", z.object({ userId: z.string(), name: z.string() }), {
+        idField: "userId",
+      }),
+    ).toThrow(/field "name" has no default/);
+    expect(tableExists("t")).toBe(false);
+
+    // The corrected call — a different idField, because nothing was ever opened
+    // under the old one — now succeeds, where it used to be refused for the life
+    // of the connection.
+    const corrected = store.collection(
+      "t",
+      z.object({ id: z.string(), name: z.string().default("") }),
+      { indexes: ["name"] },
+    );
+    expect(corrected.insert({ id: "t_1" })).toEqual({ id: "t_1", name: "" });
+
+    // And the guard itself still fires: a *successful* open pins the identity
+    // convention, so the poisoning is closed without weakening F013.
+    expect(() =>
+      store.collection("t", z.object({ userId: z.string() }), { idField: "userId" }),
+    ).toThrow(/collection\("t"\): already open with idField "id", cannot reopen with "userId"/);
+    expect(() =>
+      store.collection("T", z.object({ userId: z.string() }), { idField: "userId" }),
+    ).toThrow(/collection\("T" \(same table as "t"\)\): already open with idField "id"/);
+  });
+});
+
+// F043 — the index name replaced every dot with an underscore, so `a.b` and
+// `a_b` were one name; `CREATE INDEX IF NOT EXISTS` keys on the name and
+// compares neither the expression nor the uniqueness, so the second declaration
+// was a no-op that took a declared UNIQUE with it.
+describe("index names and redefinition (F043)", () => {
+  const CollidingSchema = z.object({
+    id: z.string(),
+    a: z.object({ b: z.string().default("") }).default({ b: "" }),
+    a_b: z.string().default(""),
+  });
+
+  const userIndexes = (store: DocStore, tableName: string): Array<{ name: string; sql: string }> =>
+    store.database
+      .query(
+        `SELECT name, sql FROM sqlite_master ` +
+          `WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL ORDER BY name`,
+      )
+      .all(tableName) as Array<{ name: string; sql: string }>;
+
+  test("two paths that used to share a name are two indexes, each with its own flag", () => {
+    const store = createStore();
+    store.collection("things", CollidingSchema, { indexes: ["a.b"] });
+    const things = store.collection("things", CollidingSchema, {
+      indexes: [{ fields: ["a_b"], unique: true }],
+    });
+
+    expect(userIndexes(store, "things")).toEqual([
+      {
+        name: "idx_things_a__b",
+        sql: `CREATE UNIQUE INDEX "idx_things_a__b" ON "things" (json_extract(doc, '$.a_b'))`,
+      },
+      {
+        name: "idx_things_a_dot_b",
+        sql: `CREATE INDEX "idx_things_a_dot_b" ON "things" (json_extract(doc, '$.a.b'))`,
+      },
+    ]);
+
+    // The constraint the second declaration asked for is a constraint the
+    // collection now has, which is the half of this that wrote data.
+    things.insert({ id: "t1", a_b: "dup" });
+    expect(() => things.insert({ id: "t2", a_b: "dup" })).toThrow(/UNIQUE constraint failed/);
+  });
+
+  test("reopening with the same declaration still creates exactly one index", () => {
+    const store = createStore();
+    const declaration = { indexes: [{ fields: ["a.b", "a_b"], unique: true }] };
+    store.collection("things", CollidingSchema, declaration);
+    store.collection("things", CollidingSchema, declaration);
+    store.collection("things", CollidingSchema, declaration);
+    // The name is a pure function of the field list, so a reopen finds the index
+    // it declared rather than adding another — the `IF NOT EXISTS` property that
+    // makes reopening a collection cheap, which this must not break.
+    expect(userIndexes(store, "things").map((index) => index.name)).toEqual([
+      "idx_things_a_dot_b_and_a__b",
+    ]);
+  });
+
+  test("the same fields declared with a different unique flag are refused", () => {
+    const store = createStore();
+    store.collection("things", CollidingSchema, { indexes: ["a_b"] });
+    // Deliberate, and stated in the `indexes` JSDoc: a redefinition is not
+    // reconciled behind the caller's back in either direction, because dropping
+    // a UNIQUE takes away a constraint and adding one can fail on stored rows.
+    expect(() =>
+      store.collection("things", CollidingSchema, {
+        indexes: [{ fields: ["a_b"], unique: true }],
+      }),
+    ).toThrow(
+      /index "idx_things_a__b" over \(a_b\) already exists as a non-unique index, and this call declares it unique.*DROP INDEX "main"\."idx_things_a__b"/s,
+    );
+    // Refused means unchanged: the existing index is still there, still not unique.
+    expect(userIndexes(store, "things")).toEqual([
+      {
+        name: "idx_things_a__b",
+        sql: `CREATE INDEX "idx_things_a__b" ON "things" (json_extract(doc, '$.a_b'))`,
+      },
+    ]);
+    // The same collision inside one call is refused by the same rule.
+    expect(() =>
+      createStore().collection("things", CollidingSchema, {
+        indexes: ["a.b", { fields: ["a.b"], unique: true }],
+      }),
+    ).toThrow(/declares \(a\.b\) twice, once non-unique and once unique/);
+  });
+
+  test("an index declaration naming no fields is refused before anything runs", () => {
+    const store = createStore();
+    expect(() =>
+      store.collection("things", CollidingSchema, { indexes: [{ fields: [] }] }),
+    ).toThrow(/an index declaration names no fields/);
+    expect(
+      store.database.query(`SELECT name FROM sqlite_master WHERE name = 'things'`).all(),
+    ).toEqual([]);
+  });
+
+  // An index name is interpolated into the SQL text — an index name cannot be
+  // bound — so the field paths it is derived from are path-checked first, and
+  // the name that reaches SQL is `[A-Za-z0-9_]` only (injection guard).
+  test("an injection-shaped index field path never reaches the SQL text", () => {
+    const store = createStore();
+    expect(() =>
+      store.collection("things", CollidingSchema, {
+        indexes: [`a_b"); DROP TABLE "things`],
+      }),
+    ).toThrow(/Invalid field path/);
+    expect(() =>
+      store.collection("things", CollidingSchema, {
+        indexes: [{ fields: ["a_b", `x'); DROP TABLE "things`] }],
+      }),
+    ).toThrow(/Invalid field path/);
+    expect(
+      store.database.query(`SELECT name FROM sqlite_master WHERE name = 'things'`).all(),
+    ).toEqual([]);
+    // The encoding only ever emits identifier characters, whatever the paths.
+    store.collection("things", CollidingSchema, { indexes: ["a.b", "a_b"] });
+    for (const index of userIndexes(store, "things")) {
+      expect(index.name).toMatch(/^[A-Za-z0-9_]+$/);
+    }
+  });
+
+  // A file written by a version up to 0.4.2 already holds indexes under the old
+  // name. Reopening it under the injective one must not leave the caller with a
+  // second index over the same expression, nor drop a constraint.
+  test("an index under the superseded name is adopted, not duplicated", () => {
+    const store = createStore();
+    store.database.run(
+      `CREATE TABLE IF NOT EXISTS "main"."things" (id TEXT PRIMARY KEY, doc TEXT NOT NULL)`,
+    );
+    store.database.run(
+      `CREATE UNIQUE INDEX "main"."idx_things_a_b" ON "things" (json_extract(doc, '$.a_b'))`,
+    );
+    const things = store.collection("things", CollidingSchema, {
+      indexes: [{ fields: ["a_b"], unique: true }],
+    });
+
+    expect(userIndexes(store, "things")).toEqual([
+      {
+        name: "idx_things_a__b",
+        sql: `CREATE UNIQUE INDEX "idx_things_a__b" ON "things" (json_extract(doc, '$.a_b'))`,
+      },
+    ]);
+    // Adopted, not merely renamed around the constraint: it still refuses the
+    // duplicate the old index refused.
+    things.insert({ id: "t1", a_b: "dup" });
+    expect(() => things.insert({ id: "t2", a_b: "dup" })).toThrow(/UNIQUE constraint failed/);
+    // And a second open has nothing left to adopt.
+    store.collection("things", CollidingSchema, { indexes: [{ fields: ["a_b"], unique: true }] });
+    expect(userIndexes(store, "things").map((index) => index.name)).toEqual(["idx_things_a__b"]);
+  });
+
+  test("a superseded name holding a different expression is left alone", () => {
+    const store = createStore();
+    store.database.run(
+      `CREATE TABLE IF NOT EXISTS "main"."things" (id TEXT PRIMARY KEY, doc TEXT NOT NULL)`,
+    );
+    // What 0.4.2 wrote for `a.b` — the name `a_b` now derives from, but over
+    // another expression. Dropping it would take away an index the caller
+    // declared in an earlier run, so it stays and the new one joins it.
+    store.database.run(
+      `CREATE INDEX "main"."idx_things_a_b" ON "things" (json_extract(doc, '$.a.b'))`,
+    );
+    store.collection("things", CollidingSchema, { indexes: [{ fields: ["a_b"], unique: true }] });
+    expect(userIndexes(store, "things").map((index) => index.name)).toEqual([
+      "idx_things_a__b",
+      "idx_things_a_b",
+    ]);
+  });
+
+  test("a name taken by an index the library did not write is refused, not ignored", () => {
+    const store = createStore();
+    store.database.run(
+      `CREATE TABLE IF NOT EXISTS "main"."things" (id TEXT PRIMARY KEY, doc TEXT NOT NULL)`,
+    );
+    store.database.run(`CREATE INDEX "main"."idx_things_a__b" ON "things" (id)`);
+    expect(() =>
+      store.collection("things", CollidingSchema, { indexes: ["a_b"] }),
+    ).toThrow(/an index named "idx_things_a__b" already exists on this table over a different expression/);
+  });
 });
 
 describe("compileWhere — unit", () => {
