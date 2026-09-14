@@ -46,6 +46,61 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
   `NOT` cannot re-scope them. `eq: null`, `ne: null`, `isNull` and every
   inclusion filter are unchanged, as is an `in`/`notIn` list of non-null values.
 
+- **An operand that cannot be compared is now refused, naming the operator or
+  field at fault, instead of silently mis-filtering.** Three paths through the
+  where-compiler answered nonsense with a filter, in a file that names a bad
+  operand everywhere else (F046,
+  [#9](https://github.com/binaryplease/zodstore/issues/9)):
+
+  ```ts
+  people.find({ where: { age: Number.NaN } });             // was [] , now throws
+  people.find({ where: { age: { gt: Number.NaN } } });     // was [] , now throws
+  people.find({ where: { nick: { isNull: "false" } } });   // was the null-valued rows, now throws
+  people.find({ where: { age: { gt: null } } });           // was [] , now throws
+  ```
+
+  `NaN` binds as SQL `NULL` and every comparison against `NULL` is unknown, so
+  the filter could only return an empty answer no caller can tell apart from a
+  truthful one — and `NaN` is what `Number(badQueryParam)` produces. `isNull`
+  branched on raw JavaScript truthiness rather than on the `boolean` its type
+  declares, so `isNull: "false"` — what a query string yields for
+  `?isNull=false` before anything parses it — selected exactly the rows
+  `isNull: false` was asked to exclude, and through
+  `deleteMany({ nick: { isNull: false } })` deleted the complement of what the
+  caller named. A `null` operand to `gt`/`gte`/`lt`/`lte` compiled to a `> ?`
+  that matched no row; the message now names `isNull` and `eq: null` as the
+  spellings that do have an answer.
+
+  **`Infinity` and `-Infinity` still pass**, decided rather than inherited: they
+  bind as numbers and order against every stored value, so `{ age: { lt:
+  Infinity } }` is the working "any number" filter it looks like, and refusing it
+  would have removed a query that answers correctly rather than a way to spell a
+  mistake. Every valid spelling compiles to exactly the SQL it compiled to
+  before — including a `Date` operand, which travels the same tightened path.
+
+- **An operator object naming no operator now narrows instead of throwing about
+  a value.** `{ age: {} }` fell through the operator-object test and was reported
+  as an unsupported *value* — *"where-clauses compare scalar fields only"* — to a
+  caller who had supplied no condition at all (F047,
+  [#10](https://github.com/binaryplease/zodstore/issues/10)). It is the shape
+  `{ ...(bound !== undefined && { gte: bound }) }` produces, which is the
+  idiomatic optional filter and is `{}` precisely when the filter is at its
+  widest — the default state of most filter screens.
+
+  ```ts
+  const minimumAge: number | undefined = undefined;
+  users.find({ where: { age: { ...(minimumAge !== undefined && { gte: minimumAge }) } } });
+  // was: throws about a scalar comparison
+  // now: [] , the same answer as the sibling spelling `{ age: { gte: undefined } }`
+  ```
+
+  It is treated as an absent condition rather than refused by name, because the
+  compiler already has an answer for a value that went missing at two depths and
+  this is the third spelling of the same situation (`F022`): absent narrows,
+  never widens, and the gap survives a `NOT` rather than being negated into a
+  match. A plain object supplied as a field *value* still raises the
+  scalar-comparison error, which is the case that test exists to catch.
+
 ### Changed
 
 - **A `null` inside an `in`/`notIn` list now names the rows that have no
@@ -62,6 +117,30 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
   to the where-clause. `json_extract` returns SQL `NULL` for both, which is what
   `eq: null` always did; `README.md` and the `FieldOperators` JSDoc now state it
   instead of leaving it to be discovered. No behaviour changes.
+
+### Note
+
+Two changes that land with the where-grammar fixes above and alter no behaviour,
+recorded because they are what keeps those fixes from being undone by an
+ordinary future edit. Nothing about the exported surface changes.
+
+- **The where-grammar's bookkeeping is now the compiler's rather than a
+  reviewer's.** An operator used to live in three places that had to agree —
+  `FieldOperators`, the `KNOWN_OPERATORS` set, and the switch that compiles it —
+  and nothing checked that they did. The switch returned `void` with no
+  `default` branch, so a new operator declared and not compiled pushed *no
+  condition*, and a clause that loses its only condition is an unfiltered
+  `DELETE FROM`. `KNOWN_OPERATORS` is now derived from a record keyed by
+  `FieldOperators`, and the switch has an exhaustiveness backstop, so a missing
+  case fails `mise run typecheck` rather than shipping (F050,
+  [#13](https://github.com/binaryplease/zodstore/issues/13)). The same
+  duplication one layer up: the reserved combinator names `"OR"` and `"NOT"`
+  were written out in both `src/query.ts` and `src/collection.ts`, so the guard
+  that stops a document field shadowing a combinator was correct only while
+  somebody remembered to edit both. `src/query.ts` owns the grammar and now
+  exports the set — internally; `src/index.ts` does not re-export it — and the
+  schema gate reads it, message included (F051,
+  [#14](https://github.com/binaryplease/zodstore/issues/14)).
 
 ## 0.4.2 — 2026-08-31
 

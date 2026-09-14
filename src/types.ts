@@ -19,13 +19,17 @@ export interface FieldOperators<TValue> {
    * (F042).
    */
   ne?: TValue;
-  /** Greater than. */
+  /**
+   * Greater than. The operand must name a value to order against: `null` is
+   * refused, because a range comparison against no value has no answer — use
+   * `isNull` or `eq: null` to name the rows that have no value (F046).
+   */
   gt?: TValue;
-  /** Greater than or equal. */
+  /** Greater than or equal. `null` is refused, as it is for `gt`. */
   gte?: TValue;
-  /** Less than. */
+  /** Less than. `null` is refused, as it is for `gt`. */
   lt?: TValue;
-  /** Less than or equal. */
+  /** Less than or equal. `null` is refused, as it is for `gt`. */
   lte?: TValue;
   /**
    * Membership. An empty list matches nothing. A `null` in the list names the
@@ -53,13 +57,22 @@ export interface FieldOperators<TValue> {
   startsWith?: string;
   /** Suffix match. The operand is escaped, so `%` and `_` are literal. */
   endsWith?: string;
-  /** `isNull: true` compiles to `IS NULL`, `false` to `IS NOT NULL`. */
+  /**
+   * `isNull: true` compiles to `IS NULL`, `false` to `IS NOT NULL`. The operand
+   * must be an actual boolean: anything else is refused rather than read for
+   * truthiness, so `isNull: "false"` — what an HTTP query string yields before
+   * anything parses it — cannot select the rows it was written to exclude
+   * (F046).
+   */
   isNull?: boolean;
 }
 
 /**
  * A single field's condition: either a bare value (shorthand for `{ eq: value }`)
- * or an operator object.
+ * or an operator object. An operator object naming no operator — `{}`, which is
+ * what the idiomatic optional-filter spread produces when the bound is unset —
+ * is a condition that was not supplied, and narrows to no match rather than
+ * widening (F047).
  */
 export type FieldCondition<TValue> = TValue | FieldOperators<TValue>;
 

@@ -112,6 +112,16 @@ outside years 0000–9999 (whose expanded ISO form would not order against store
 timestamps — `dateParser` refuses to store one either), is refused naming the
 operator or field at fault.
 
+**An operand that cannot be compared is refused, not answered with an empty result.** A
+filter that quietly matches nothing reads exactly like a truthful "no rows", so the
+operand is named instead: `NaN` (which is what `Number(badQueryParam)` produces, and which
+binds as SQL `NULL`), a non-boolean `isNull` (`"false"` is what `?isNull=false` yields
+before anything parses it, and it used to select the rows it was written to exclude), and
+a `null` operand to `gt`/`gte`/`lt`/`lte` (a range comparison against no value has no
+answer — `isNull` or `eq: null` is the spelling that does). `Infinity` and `-Infinity`
+pass: they bind as numbers and order against every stored value, so `{ age: { lt:
+Infinity } }` is the "any number" filter it looks like.
+
 ### `ne` and `notIn` keep the null-valued rows
 
 **A row with no value is excluded from the named *set*, not from the *answer*.** `ne` and
@@ -163,8 +173,17 @@ cases.deleteMany({ assignee: currentUser });            // → 0 rows deleted, n
 ```
 
 The rule holds wherever the value goes missing: in an operator object
-(`{ age: { gte: undefined } }`) and beside a live sibling (`{ status: "open", assignee:
-undefined }` matches nothing rather than every open case).
+(`{ age: { gte: undefined } }`), beside a live sibling (`{ status: "open", assignee:
+undefined }` matches nothing rather than every open case), and in an operator object that
+names no operator at all:
+
+```ts
+const minimumAge: number | undefined = undefined;       // the facet is cleared
+
+// the idiomatic optional filter — `{ age: {} }` when the bound is not supplied
+users.find({ where: { age: { ...(minimumAge !== undefined && { gte: minimumAge }) } } });
+// → [] , the same answer as `{ age: { gte: undefined } }`
+```
 
 **A gap can never be negated into a match.** A clause carrying a missing value anywhere
 below it compiles to "no rows" under `NOT` rather than being negated, at any depth:
