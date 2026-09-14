@@ -2032,7 +2032,14 @@ describe("the membership read path (F027)", () => {
     // build.
     expect(varyingFindMegabytes).toBeLessThan(fixedArityMegabytes + 48);
     expect(varyingFindByIdsMegabytes).toBeLessThan(fixedArityMegabytes + 48);
-  });
+    // Seven sweeps of 2 000 calls and six full `Bun.gc(true)` collections: ~3.5 s
+    // on a developer machine and ~6.8 s on the GitHub runner, which is past Bun's
+    // implicit 5 000 ms per-test default. The bound is declared rather than
+    // inherited, because the alternative — a shorter sweep — moves the numbers the
+    // 48 MB slack above was calibrated against, and the arms are compared to a
+    // control rather than to wall-clock, so a slow runner cannot pass a leaking
+    // build. 30 s is headroom over the measured runner cost, not a target.
+  }, 30_000);
 });
 
 // F010 — find() with no limit selected every matching row and parsed each one
