@@ -286,8 +286,10 @@ export interface TableBinding {
 // Hung off the `Database` instance rather than off a store closure, so
 // `store.collection()` and a direct `createCollection(database, …)` share one
 // registry. Weak so a closed database's bindings are collectable. It is an
-// in-process guard only: a second connection to the same file starts with an
-// empty registry, which F018 tracks.
+// in-process guard, and the first of two: it answers before any statement runs
+// and it answers on an empty table, but a second connection to the same file
+// starts with an empty registry. `assertStoredIdentityConvention` below is the
+// half that survives a close, by reading the convention back off a stored row.
 //
 // A cross-store transaction runs on a connection of its own, so its registry
 // starts empty too — which would make this guard structurally unreachable on
@@ -366,6 +368,123 @@ function bindTable(
 ): void {
   assertTableBinding(database, databaseName, name, idField);
   recordTableBinding(database, databaseName, name, idField);
+}
+
+/**
+ * One stored row, read as the two things an identity check compares: the column
+ * the table is keyed by, and the document that column's value was taken from.
+ */
+interface StoredRowProbe {
+  readonly id: string;
+  readonly doc: string;
+}
+
+/**
+ * Read one stored row of a table, and the table's own spelling, or `null` when
+ * there is no table or no readable row.
+ *
+ * Rows whose JSON is malformed are skipped in SQL rather than in this process:
+ * a damaged row says nothing about the identity convention, and it must not be
+ * the row this check happens to draw — `validate()` and `onParseError: "skip"`
+ * are how such a row is repaired, and both need the collection to open first.
+ *
+ * The table name is bound as a *value* for the catalogue lookup and compared
+ * case-insensitively, because SQLite resolves identifiers that way; the probe
+ * itself interpolates the name that `assertIdentifier` has already passed, as
+ * every other statement of an open does.
+ */
+function readStoredRowProbe(
+  database: Database,
+  databaseName: string,
+  name: string,
+): { row: StoredRowProbe | null; tableName: string } | null {
+  const tables = database
+    .query(
+      `SELECT name FROM "${databaseName}".sqlite_master ` +
+        `WHERE type = 'table' AND lower(name) = lower(?)`,
+    )
+    .all(name) as Array<{ name: string }>;
+  const table = tables[0];
+  if (table === undefined) return null;
+  const rows = database
+    .query(`SELECT id, doc FROM "${databaseName}"."${name}" WHERE json_valid(doc) LIMIT 1`)
+    .all() as StoredRowProbe[];
+  return { row: rows[0] ?? null, tableName: table.name };
+}
+
+/**
+ * The field a stored document keys its row by: the one key whose value *is* the
+ * row's primary key. `null` when no key holds it, or when several do and the
+ * evidence therefore names no single convention.
+ *
+ * Restricted to keys shaped like an identifier because every legal `idField`
+ * is one (`assertIdentifier`), and because this name goes into an exception
+ * message: the keys of a stored document are field names under an object schema,
+ * but they are caller data under a record, and this library never puts document
+ * content in a message. A key that cannot be an `idField` is not the answer
+ * being looked for anyway, so dropping it costs nothing and closes that route.
+ */
+function readStoredIdField(document: Record<string, unknown>, storedId: string): string | null {
+  const holders = Object.keys(document).filter(
+    (key) => document[key] === storedId && IDENTIFIER_PATTERN.test(key),
+  );
+  return holders.length === 1 ? (holders[0] as string) : null;
+}
+
+/**
+ * Refuse a reopen whose `idField` disagrees with what the table's stored rows
+ * were written under (F018, #1).
+ *
+ * The registry above is in-process, so it is empty in the case that costs the
+ * most: a file that already holds rows, opened by a process that has never
+ * opened it before. A server keeping one SQLite file per customer is exactly
+ * that shape. This check reads the convention back off the rows instead, so it
+ * survives the close that empties the registry.
+ *
+ * The evidence is a row itself rather than any library-owned schema: every write
+ * stores the id column as `document[idField]`, so a row whose `idField` value is
+ * not its primary key was written under a different convention. That keeps this
+ * library's premise — the file holds the caller's tables and nothing of this
+ * library's — and it answers on tables that already exist, with no migration.
+ *
+ * What it cannot answer, by construction: an **empty** table carries no evidence,
+ * and neither does a table whose rows all hold the new `idField`'s value at the
+ * old `idField` too. The in-process registry still catches both inside one
+ * process. Closing those would take a library-owned metadata table, which is a
+ * decision for the maintainer rather than for this guard.
+ */
+function assertStoredIdentityConvention(
+  database: Database,
+  databaseName: string,
+  name: string,
+  idField: string,
+): void {
+  const probe = readStoredRowProbe(database, databaseName, name);
+  if (probe === null || probe.row === null) return;
+  // `json_valid` has already passed on this row, so this parse does not throw.
+  const document = JSON.parse(probe.row.doc) as unknown;
+  if (!isRecord(document)) return;
+  if (document[idField] === probe.row.id) return;
+
+  // Name both spellings when they differ, exactly as the in-process guard does:
+  // a case-variant reopen is a name the caller believes is new, and the refusal
+  // is only actionable if it says which table it collides with.
+  const openedAs =
+    probe.tableName.toLowerCase() === name.toLowerCase() && probe.tableName !== name
+      ? `"${name}" (same table as "${probe.tableName}")`
+      : `"${name}"`;
+  const storedIdField = readStoredIdField(document, probe.row.id);
+  const convention =
+    storedIdField === null
+      ? `a stored row's primary key is not the value of its "${idField}" field, so the ` +
+        `rows were written under a different idField and cannot be read through this one`
+      : `stored rows are keyed by idField "${storedIdField}", cannot reopen with "${idField}"`;
+  throw new Error(
+    `collection(${openedAs}): ${convention}. One table holds one identity convention; ` +
+      `reopening with an extended schema is supported, changing the id field is not. ` +
+      `The convention is read back off a stored row, so it outlives the connection that ` +
+      `wrote it.`,
+  );
 }
 
 /**
@@ -1211,7 +1330,14 @@ function openResolvedCollection<TSchema extends z.ZodType>(
   // `resolveCollectionOptions` upstream of this function — so a bad one never
   // leaves a table behind — and the reopen conflict is refused here, before the
   // open can add an index or a row under the wrong identity convention.
+  //
+  // In this order because the two guards answer at different costs: the registry
+  // is a map lookup and catches the same-process case before any statement runs,
+  // and the stored-row probe is a query that catches what a close would have
+  // erased (F018, #1). Both read only, so a refusal from either leaves the file
+  // as it was.
   assertTableBinding(database, databaseName, name, idField);
+  assertStoredIdentityConvention(database, databaseName, name, idField);
 
   const quotedTable = `"${databaseName}"."${name}"`;
 

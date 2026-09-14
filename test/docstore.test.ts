@@ -2180,28 +2180,133 @@ describe("collection reopen bindings (F013)", () => {
     ).toThrow(/already open with idField "id"/);
   });
 
-  // The registry lives in memory, so a second connection to the same file does
-  // not see it and the conflicting reopen is accepted there. That is the
-  // residual F018 tracks, pinned here so closing it fails this test rather than
-  // slipping through: this asserts what currently happens, not what should.
-  // It has to be one file opened twice — two independent stores share no table
-  // and no binding, so they would agree whether or not the residual existed.
-  test("a second connection does not yet see the binding (F018 residual)", () => {
+  // F018 (#1) — the registry lives in memory, so a second connection to the same
+  // file started with an empty one and *accepted* the conflicting reopen; this
+  // test used to pin that residual. The convention is now read back off a stored
+  // row, so it outlives the connection that wrote it. It has to be one file
+  // opened twice — two independent stores share no table and no binding, so they
+  // would agree whether or not the guard existed.
+  test("a second connection reads the identity convention off a stored row (F018, #1)", () => {
     withTemporaryDirectory((databasePath) => {
       const first = createStore({ path: databasePath });
       first.collection("ks", z.object({ id: ref("k") })).insert({ id: "k_1" });
       first.close();
 
       const second = createStore({ path: databasePath });
-      second
-        .collection("ks", z.object({ slug: ref("k") }), { idField: "slug" })
-        .insert({ slug: "k_2" });
-      // F013's evidence, surviving a close: one table, two identity conventions,
-      // and no complaint. Closing F018 makes this reopen throw, which fails here.
-      expect(second.database.query(`SELECT id FROM "ks"`).all()).toEqual([
-        { id: "k_1" },
-        { id: "k_2" },
-      ]);
+      expect(() =>
+        second.collection("ks", z.object({ slug: ref("k") }), { idField: "slug" }),
+      ).toThrow(
+        /collection\("ks"\): stored rows are keyed by idField "id", cannot reopen with "slug"/,
+      );
+      // The conflicting handle never came into existence, so the table still
+      // holds only the first connection's row — F013's end state, refused one
+      // process later than the registry could refuse it.
+      expect(second.database.query(`SELECT id FROM "ks"`).all()).toEqual([{ id: "k_1" }]);
+      second.close();
+    });
+  });
+
+  test("a case-variant reopen on a second connection names both spellings (#1)", () => {
+    withTemporaryDirectory((databasePath) => {
+      const first = createStore({ path: databasePath });
+      first.collection("ks", z.object({ id: ref("k") })).insert({ id: "k_1" });
+      first.close();
+
+      const second = createStore({ path: databasePath });
+      // SQLite resolves identifiers case-insensitively, so the catalogue lookup
+      // has to as well — otherwise "KS" reads as a table with no rows and the
+      // conflict is accepted for want of evidence.
+      expect(() =>
+        second.collection("KS", z.object({ slug: ref("k") }), { idField: "slug" }),
+      ).toThrow(/collection\("KS" \(same table as "ks"\)\): stored rows are keyed by idField "id"/);
+      expect(second.database.query(`SELECT id FROM "ks"`).all()).toEqual([{ id: "k_1" }]);
+      second.close();
+    });
+  });
+
+  test("a second connection still reopens freely with an extended schema (#1)", () => {
+    withTemporaryDirectory((databasePath) => {
+      const first = createStore({ path: databasePath });
+      first
+        .collection("people", z.object({ id: ref("user"), name: z.string().default("") }))
+        .insert({ id: "user_legacy", name: "Legacy" });
+      first.collection("keyed", z.object({ key: z.string() }), { idField: "key" }).insert({
+        key: "k_1",
+      });
+      first.close();
+
+      // The forward-compatibility path is what the guard must not cost: same
+      // idField, more fields, a connection that has never seen this file.
+      const second = createStore({ path: databasePath });
+      const extended = second.collection(
+        "people",
+        z.object({
+          id: ref("user"),
+          name: z.string().default(""),
+          role: z.enum(["admin", "member"]).default("member"),
+        }),
+      );
+      expect(extended.get("user_legacy")).toEqual({
+        id: "user_legacy",
+        name: "Legacy",
+        role: "member",
+      });
+      // A non-default idField reopens under itself across a close just as freely.
+      expect(
+        second
+          .collection("keyed", z.object({ key: z.string(), tag: z.string().default("") }), {
+            idField: "key",
+          })
+          .get("k_1"),
+      ).toEqual({ key: "k_1", tag: "" });
+      second.close();
+    });
+  });
+
+  test("a damaged row is not the evidence, and does not block the open (#1)", () => {
+    withTemporaryDirectory((databasePath) => {
+      const first = createStore({ path: databasePath });
+      first.collection("ks", z.object({ id: ref("k") }));
+      // Ahead of every readable row, so a probe that took the first row it found
+      // would draw this one. A row whose JSON is malformed says nothing about the
+      // identity convention — and refusing the open over it would take away
+      // validate() and { onParseError: "skip" }, which are how it gets repaired.
+      first.database.run(`INSERT INTO "ks" (id, doc) VALUES ('k_0', '{"id":"k_0",}')`);
+      first.collection("ks", z.object({ id: ref("k") })).insert({ id: "k_1" });
+      first.close();
+
+      const second = createStore({ path: databasePath });
+      expect(() =>
+        second.collection("ks", z.object({ slug: ref("k") }), { idField: "slug" }),
+      ).toThrow(/stored rows are keyed by idField "id"/);
+      // The repair path still opens: same idField, damaged row and all.
+      expect(second.collection("ks", z.object({ id: ref("k") }), { onParseError: "skip" }).find())
+        .toEqual([{ id: "k_1" }]);
+      second.close();
+    });
+  });
+
+  // The documented limit of reading the convention off the rows: an empty table
+  // carries no evidence, so the guard is the in-process registry alone there.
+  // Pinned so that a fix which does answer on an empty table — the metadata table
+  // the issue routes to the maintainer — fails this test rather than passing it
+  // silently, exactly as the F018 residual did.
+  test("an empty table carries no evidence, so a second connection accepts it (#1)", () => {
+    withTemporaryDirectory((databasePath) => {
+      const first = createStore({ path: databasePath });
+      first.collection("ks", z.object({ id: ref("k") }));
+      first.close();
+
+      const second = createStore({ path: databasePath });
+      expect(
+        second.collection("ks", z.object({ slug: ref("k") }), { idField: "slug" }).insert({
+          slug: "k_2",
+        }),
+      ).toEqual({ slug: "k_2" });
+      // In-process, the registry answers before any row is written.
+      expect(() => second.collection("ks", z.object({ id: ref("k") }))).toThrow(
+        /already open with idField "slug", cannot reopen with "id"/,
+      );
       second.close();
     });
   });
@@ -2328,6 +2433,16 @@ describe("collection reopen bindings (F013)", () => {
           indexes: [{ fields: ["email"], unique: true }],
         }),
       ).toThrow(/UNIQUE constraint failed/);
+      // What the rows themselves say is a separate guard and still holds: they
+      // were written under "userId", so no retry may reopen them under another
+      // id field (F018, #1).
+      expect(() =>
+        after.collection("t", z.object({ id: z.string(), email: z.string().default("") })),
+      ).toThrow(/stored rows are keyed by idField "userId"/);
+      // Cleared out of band, as an operator repairing the duplicate would: an
+      // empty table pins no identity convention, so the registry is the only
+      // thing that could still refuse the corrected call below.
+      after.database.run(`DELETE FROM "t"`);
       // The open failed, so nothing is open under "userId" — the corrected call
       // is not refused against an identity convention no open established.
       const retried = after.collection(

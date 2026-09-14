@@ -569,8 +569,24 @@ store.collection("ks", z.object({ slug: ref("k") }), { idField: "slug" });
 ```
 
 The check is case-insensitive, because SQLite identifiers are — `"KS"` and `"ks"` are one
-table and so one binding. It is also **in-process only**: the binding lives in memory, so
-a second connection to the same file does not yet see it (tracked as F018).
+table and so one binding.
+
+It **survives a close**. The binding a handle records lives in memory, so a second
+connection — a redeployed process opening a file that already holds rows — starts without
+it; the convention is therefore also read back off the rows themselves, because every
+write stores the id column as `document[idField]`. A reopen whose `idField` is not what a
+stored row is keyed by is refused the same way, naming the field the rows carry:
+
+```ts
+// a fresh process, on a file the snippet above wrote
+store.collection("ks", z.object({ slug: ref("k") }), { idField: "slug" });
+// throws: collection("ks"): stored rows are keyed by idField "id", cannot reopen with "slug".
+```
+
+Nothing of this library's is written to the file to make that work — there is no metadata
+table — so the guard answers on files that already exist, and on exactly the evidence the
+rows carry. An **empty** table carries none, so there the in-process binding is the whole
+of the check.
 
 That rule is **enforced, not documented**: `store.collection(...)` walks an object
 schema at creation and refuses a non-identity field with no `.default(...)`,

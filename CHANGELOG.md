@@ -13,6 +13,41 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
 
 ### Fixed
 
+- **A conflicting `idField` reopen is now refused across connections, not only
+  within one.** The registry that pins a table's identity convention lives in
+  memory, so a second process opening the same file started with an empty one and
+  accepted a reopen the first process would have refused — leaving one table
+  holding rows under two identity conventions, where a row written through one
+  handle cannot be read through the other. A server that keeps one SQLite file per
+  customer is exactly that shape: the file is opened per process, and the registry
+  that would refuse the conflict is empty every time the conflict can occur
+  ([#1](https://github.com/binaryplease/zodstore/issues/1)).
+
+  ```ts
+  // process 1
+  first.collection("ks", z.object({ id: ref("k") })).insert({ id: "k_1" });
+  first.close();
+
+  // process 2, on the same file
+  second.collection("ks", z.object({ slug: ref("k") }), { idField: "slug" });
+  // was: accepted — SELECT id FROM ks → [{ id: "k_1" }, { id: "k_2" }],
+  //      and reading k_1 through the slug handle threw
+  // now: throws: collection("ks"): stored rows are keyed by idField "id",
+  //      cannot reopen with "slug"
+  ```
+
+  The convention is read back off a stored row rather than out of any
+  library-owned schema: every write stores the id column as `document[idField]`,
+  so a row whose `idField` value is not its own primary key was written under a
+  different convention. Nothing is added to the file, so the check answers on
+  files that already exist and needs no migration. Its limit is the evidence: an
+  **empty** table carries none, and there the in-memory registry — which still
+  runs first, and still catches the same-process case before any statement — is
+  the whole of the check. A reopen with an *extended* schema and the same
+  `idField` is unaffected on any connection, and a row whose stored JSON is
+  malformed is never the evidence, so `validate()` and `{ onParseError: "skip" }`
+  can still open a damaged collection to repair it.
+
 - **A `like` operand that is not a string is now refused instead of compiling a
   filter that matches nothing.** `like` was the one operator in the LIKE family
   without an operand guard: `contains`, `startsWith` and `endsWith` all refuse a
