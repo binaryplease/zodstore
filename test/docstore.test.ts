@@ -27,6 +27,7 @@ import {
   type FieldOperators,
   populate,
   ref,
+  type SqlParameter,
   transactionAcross,
 } from "../src/index.ts";
 // Not part of the published surface — `src/index.ts` deliberately does not
@@ -34,7 +35,23 @@ import {
 // (F051). The suite reads it from the module that owns it, which is the point:
 // a test that hardcoded the same two strings would be the third copy of the
 // list this change exists to collapse.
-import { RESERVED_WHERE_KEYS } from "../src/query.ts";
+// The same two, for the same reason: `compileMembership` and
+// `encodeMembershipList` describe how a list reaches SQL rather than the
+// library's surface, and the F027 plan assertion reads them from the module that
+// owns them so it cannot assert a fragment the compiler has stopped emitting.
+import {
+  compileMembership,
+  encodeMembershipList,
+  RESERVED_WHERE_KEYS,
+} from "../src/query.ts";
+
+/**
+ * The subquery an `in`/`notIn` list compiles to, spelled once (F027). The list
+ * binds as a single JSON array, so this fragment is the same at every length —
+ * which is the whole property, and the reason the SQL-shape assertions below can
+ * name it rather than a placeholder run.
+ */
+const MEMBERSHIP_SOURCE = "SELECT value FROM json_each(?)";
 
 function inTemporaryDirectory<TResult>(work: (directory: string) => TResult): TResult {
   const directory = mkdtempSync(join(tmpdir(), "docstore-"));
@@ -847,6 +864,83 @@ describe("OR / NOT combinators (F012)", () => {
     ).toThrow(/field "NOT" is a reserved where-clause key/);
   });
 
+  // F020 — the guard read `schema.shape` directly, so an object schema wrapped
+  // in anything that hides `.shape` walked straight past it. The collision it
+  // exists to refuse is silent on the other side: the field is matched as a
+  // combinator before it can reach `jsonExtract`, so `{ NOT: { eq: "v" } }`
+  // compiled to `WHERE NOT (json_extract(doc, '$.eq') = ?)` and answered with
+  // rows that do not match — through `deleteMany`, a silently wrong delete.
+  test("a wrapped object schema is refused for a reserved field name too (F020)", () => {
+    const wrapped = {
+      transform: z
+        .object({ id: ref("b"), NOT: z.string().default("") })
+        .transform((document) => document),
+      pipe: z
+        .object({ id: ref("b"), NOT: z.string().default("") })
+        .pipe(z.object({ id: z.string(), NOT: z.string() })),
+      brand: z.object({ id: ref("b"), NOT: z.string().default("") }).brand<"Doc">(),
+      default: z
+        .object({ id: ref("b"), NOT: z.string().default("") })
+        .default({ id: "b_1", NOT: "" }),
+      readonly: z.object({ id: ref("b"), NOT: z.string().default("") }).readonly(),
+      lazy: z.lazy(() => z.object({ id: ref("b"), NOT: z.string().default("") })),
+    };
+    for (const [label, schema] of Object.entries(wrapped)) {
+      const store = createStore();
+      expect(
+        () => store.collection("bad", schema as unknown as z.ZodType),
+        `wrapped in .${label}()`,
+      ).toThrow(/field "NOT" is a reserved where-clause key/);
+    }
+  });
+
+  // What a write *stores* is the schema's output, so a reserved name that only
+  // appears on a pipe's far side is the same collision. The declared-default
+  // rule still reads the input side — that is what an already-stored row is
+  // parsed against — but this guard is about names, and it reads both.
+  test("a reserved name on a pipe's output side is refused too", () => {
+    const store = createStore();
+    const piped = z
+      .object({ id: ref("b"), value: z.string().default("") })
+      .pipe(z.object({ id: z.string(), value: z.string(), NOT: z.string().default("x") }));
+    expect(() => store.collection("bad", piped as unknown as z.ZodType)).toThrow(
+      /field "NOT" is a reserved where-clause key/,
+    );
+  });
+
+  // The limit that is left, pinned so it stays a known one. A `.transform()`
+  // declares its output in a function body, and no reader can say what a
+  // function returns without running it — so a transform that *adds* a reserved
+  // name is accepted, and the field it stores is unreachable by a where-clause.
+  // The guard is a strong default, not a proof; the README, `Where`'s JSDoc and
+  // the guard's own JSDoc all say so, and say not to name a field OR or NOT.
+  test("a transform that adds a reserved field is the guard's known limit", () => {
+    const store = createStore();
+    const added = z
+      .object({ id: ref("d"), value: z.string().default("") })
+      .loose()
+      .transform((document) => ({ ...document, NOT: "flagged" }));
+    // Accepted: the output shape is a function body, not a declaration.
+    const rows = store.collection("docs", added as unknown as z.ZodType) as unknown as {
+      insert(input: { id: string; value: string }): unknown;
+      find(options: { where: Record<string, unknown> }): unknown[];
+    };
+    rows.insert({ id: "d_1", value: "v" });
+    // And the stored field is addressed as the combinator, never as a field —
+    // which is exactly why the disclosure has to stay honest.
+    expect(rows.find({ where: { NOT: { eq: "flagged" } } })).toEqual([]);
+    expect(rows.find({ where: { id: { eq: "d_1" } } })).toHaveLength(1);
+  });
+
+  test("the same wrappers create a collection when no field is reserved (F020)", () => {
+    const store = createStore();
+    const notes = store.collection(
+      "notes",
+      z.object({ id: ref("n"), body: z.string().default("") }).transform((document) => document),
+    );
+    expect(notes.insert({ id: "n_1", body: "kept" })).toEqual({ id: "n_1", body: "kept" });
+  });
+
   // F051 — the reserved names were written out twice, in the two files that have
   // to agree about them, with no import and no type relating the lists. The
   // guard above was correct only for as long as somebody remembered to edit
@@ -1625,6 +1719,329 @@ describe("the paged read path (F024, F025)", () => {
   });
 });
 
+// F027 — the other unbounded axis into the same cache F024 closed for the page
+// bounds. The element *count* of an `in`/`notIn` list was part of the SQL text,
+// so `in` over three values and `in` over four were two statements, and
+// `Database.query()` keeps one prepared statement per distinct SQL string for
+// the life of the connection with no eviction. `findByIds` spelled the same
+// thing for its batch size.
+//
+// Worse than F024 on two counts. The length is what an endpoint forwards from
+// `?ids=a,b,c` or a multi-select filter, so the cardinality of that cache is the
+// caller's to choose rather than the code's; and the growth is quadratic in the
+// longest list seen, because each retained statement is itself proportional to
+// its arity. The issue measured 122 MB retained over arities 1..2000 against
+// 0.9 MB for a fixed-arity control.
+//
+// The list now binds as a single JSON array read back by `json_each`, so the
+// statement is the same at every length — measured against padding the list up
+// to a power-of-two bucket, which caps the cache at ~16 statements per form but
+// still retains the largest of them and has to special-case
+// SQLITE_MAX_VARIABLE_NUMBER. The subquery form was chosen because the query
+// plan holds (asserted below) and it removes the axis outright rather than
+// bounding it.
+describe("the membership read path (F027)", () => {
+  const MemberSchema = z.object({
+    id: ref("m"),
+    tag: z.string().nullable().default(null),
+  });
+
+  /**
+   * `rowCount` rows whose tags cycle through ten values, with every fifth row
+   * carrying no tag at all — so the null-bearing forms have rows to include and
+   * exclude at every list length rather than only at the ends.
+   */
+  function seeded(rowCount: number) {
+    const store = createStore();
+    const members = store.collection("members", MemberSchema, { indexes: ["tag"] });
+    members.insertMany(
+      Array.from({ length: rowCount }, (_unused, index) => ({
+        id: `m_${index}`,
+        tag: index % 5 === 0 ? null : `t_${index % 10}`,
+      })),
+    );
+    return { store, members };
+  }
+
+  const byId = { field: "id" } as const;
+
+  test("in and notIn answer the same at every length from 0 to 300", () => {
+    const { members } = seeded(40);
+    const stored = members.find({ orderBy: byId });
+    // A pool that overlaps the stored tags at its head and runs far past them,
+    // so the sweep covers a list shorter than the tag set, one that matches it
+    // exactly, and one much longer than the collection.
+    const pool = Array.from({ length: 300 }, (_unused, index) => `t_${index}`);
+    const idsWhere = (where: Record<string, unknown>) =>
+      members.find({ where: where as never, orderBy: byId }).map((member) => member.id);
+    const idsWhen = (keep: (tag: string | null) => boolean) =>
+      stored.filter((member) => keep(member.tag)).map((member) => member.id);
+
+    for (let length = 0; length <= pool.length; length += 1) {
+      const list = pool.slice(0, length);
+      const named = new Set(list);
+      // The oracle is the same set membership computed in JavaScript, which is
+      // what the unquantised placeholder run computed in SQL. It closes over the
+      // empty list too: an empty `in` names nothing, an empty `notIn` excludes
+      // nothing, which is exactly `named` being empty.
+      expect(idsWhere({ tag: { in: list } })).toEqual(
+        idsWhen((tag) => tag !== null && named.has(tag)),
+      );
+      expect(idsWhere({ tag: { notIn: list } })).toEqual(
+        idsWhen((tag) => tag === null || !named.has(tag)),
+      );
+      // The second axis the cache keyed on (#15): a `null` in the list names the
+      // rows that have no value, and the two operators stay exact complements at
+      // every length. At length 0 these are `in: [null]` ≡ `eq: null` and
+      // `notIn: [null]` ≡ `ne: null`.
+      const withNull = [...list, null];
+      expect(idsWhere({ tag: { in: withNull } })).toEqual(
+        idsWhen((tag) => tag === null || named.has(tag)),
+      );
+      expect(idsWhere({ tag: { notIn: withNull } })).toEqual(
+        idsWhen((tag) => tag !== null && !named.has(tag)),
+      );
+      // Complementary as sets, at this length, in both null-presence forms.
+      expect([...idsWhere({ tag: { in: list } }), ...idsWhere({ tag: { notIn: list } })].sort())
+        .toEqual(stored.map((member) => member.id).sort());
+      expect(
+        [...idsWhere({ tag: { in: withNull } }), ...idsWhere({ tag: { notIn: withNull } })].sort(),
+      ).toEqual(stored.map((member) => member.id).sort());
+    }
+
+    // The two decided cases, spelled out rather than left to the sweep's oracle.
+    expect(idsWhere({ tag: { in: [] } })).toEqual([]);
+    expect(idsWhere({ tag: { notIn: [] } })).toEqual(stored.map((member) => member.id));
+    expect(idsWhere({ tag: { in: [null] } })).toEqual(idsWhere({ tag: { eq: null } }));
+    expect(idsWhere({ tag: { notIn: [null] } })).toEqual(idsWhere({ tag: { ne: null } }));
+  });
+
+  test("findByIds still dedupes and preserves the order of first appearance", () => {
+    const { members } = seeded(40);
+    expect(members.findByIds([])).toEqual([]);
+    expect(
+      members.findByIds(["m_7", "m_2", "m_7", "m_999", "m_2", "m_0"]).map((member) => member.id),
+    ).toEqual(["m_7", "m_2", "m_0"]);
+    // The batch size is the axis that used to mint a statement of its own, so the
+    // ordering has to hold at a length no placeholder run would have reached
+    // twice — every id twice, the second copy dropped, the first order kept.
+    const requested = Array.from({ length: 40 }, (_unused, index) => `m_${39 - index}`);
+    expect(members.findByIds([...requested, ...requested]).map((member) => member.id)).toEqual(
+      requested,
+    );
+  });
+
+  test("a list element binds as the value it bound as a placeholder", () => {
+    const store = createStore();
+    const flags = store.collection(
+      "flags",
+      z.object({ id: ref("f"), on: z.boolean().default(false), size: z.number().default(0) }),
+    );
+    flags.insertMany([
+      { id: "f_1", on: true, size: 1 },
+      { id: "f_2", on: false, size: 2.5 },
+      { id: "f_3", on: true, size: 1e21 },
+    ]);
+    // The encoding is the new place a value's type could drift. A JSON boolean is
+    // not what `json_extract` returns for a stored one — it returns the integer
+    // `1`/`0` — so the list carries what `toSqlParameter` already produced, and
+    // an exponent-form number still reads back as the same REAL.
+    expect(flags.find({ where: { on: { in: [true] } }, orderBy: byId }).map((flag) => flag.id))
+      .toEqual(["f_1", "f_3"]);
+    expect(flags.find({ where: { on: { notIn: [true] } } }).map((flag) => flag.id)).toEqual([
+      "f_2",
+    ]);
+    expect(
+      flags.find({ where: { size: { in: [2.5, 1e21] } }, orderBy: byId }).map((flag) => flag.id),
+    ).toEqual(["f_2", "f_3"]);
+    // A string that is a number's decimal spelling must stay a string, or it
+    // would start matching a numeric field it never matched before.
+    expect(flags.find({ where: { size: { in: ["1"] as never } } })).toEqual([]);
+  });
+
+  test("a list past SQLite's parameter ceiling is answerable at all", () => {
+    const { members } = seeded(40);
+    // A statement may carry 65 535 parameters on the SQLite Bun ships — measured,
+    // not assumed — so a placeholder per element refused a longer list outright.
+    // One bound array has no such ceiling, which is a consequence of the shape
+    // rather than its point, and is asserted so it stays true.
+    const PAST_THE_CEILING = 70_000;
+    const ids = Array.from({ length: PAST_THE_CEILING }, (_unused, index) => `m_${index}`);
+    expect(members.findByIds(ids).map((member) => member.id)).toEqual(
+      Array.from({ length: 40 }, (_unused, index) => `m_${index}`),
+    );
+    const tags = Array.from({ length: PAST_THE_CEILING }, (_unused, index) => `t_${index}`);
+    expect(members.count({ tag: { in: tags } })).toBe(
+      members.find({ where: { tag: { isNull: false } } }).length,
+    );
+  });
+
+  test("a list value is data, never SQL, however it is spelled", () => {
+    const { members } = seeded(40);
+    const injection = `t_1", "x'); DROP TABLE "members`;
+    // The list is one bound JSON parameter now rather than a run of placeholders,
+    // so the encoder is the new place a value could have escaped into the text.
+    // It does not: this names no row, and the table is still there afterwards.
+    expect(members.find({ where: { tag: { in: [injection] } } })).toEqual([]);
+    expect(members.findByIds([injection, "m_1"]).map((member) => member.id)).toEqual(["m_1"]);
+    // A value carrying the JSON metacharacters of the encoding itself.
+    expect(members.find({ where: { tag: { in: [`","`, "[]", `\\"`, "t_1"] } } }).length).toBe(
+      members.find({ where: { tag: { eq: "t_1" } } }).length,
+    );
+    expect(members.count({})).toBe(40);
+  });
+
+  test("a non-finite operand keeps the answer it had as a placeholder", () => {
+    const store = createStore();
+    const readings = store.collection(
+      "readings",
+      z.object({ id: ref("r"), level: z.number().nullable().default(null) }),
+    );
+    readings.insertMany([
+      { id: "r_1", level: 1 },
+      { id: "r_2", level: 2 },
+      { id: "r_3", level: null },
+    ]);
+    // `toSqlParameter` passes ±Infinity deliberately, and `JSON.stringify` has no
+    // spelling for it — it emits `null`, and a `null` inside the array a `NOT IN`
+    // reads makes that predicate unknown for every row. So `notIn: [Infinity]`
+    // would have flipped from "every row" to "no row" on a naive encoding.
+    expect(readings.find({ where: { level: { in: [Number.POSITIVE_INFINITY] } } })).toEqual([]);
+    expect(
+      readings
+        .find({ where: { level: { notIn: [Number.POSITIVE_INFINITY] } }, orderBy: byId })
+        .map((reading) => reading.id),
+    ).toEqual(["r_1", "r_2", "r_3"]);
+    expect(
+      readings
+        .find({ where: { level: { in: [Number.NEGATIVE_INFINITY, 2] } }, orderBy: byId })
+        .map((reading) => reading.id),
+    ).toEqual(["r_2"]);
+    expect(
+      readings
+        .find({ where: { level: { notIn: [Number.NEGATIVE_INFINITY, 2] } }, orderBy: byId })
+        .map((reading) => reading.id),
+    ).toEqual(["r_1", "r_3"]);
+    // NaN is still the refusal it was (F046), not a third encoding.
+    expect(() => readings.find({ where: { level: { in: [Number.NaN] } } })).toThrow(
+      /Invalid number operand for operator "in"/,
+    );
+  });
+
+  test("the subquery form still resolves through the id and field indexes", () => {
+    const { store, members } = seeded(2_000);
+    const plan = (sql: string, parameters: SqlParameter[]) =>
+      (
+        store.database.query(`EXPLAIN QUERY PLAN ${sql}`).all(...parameters) as Array<{
+          detail: string;
+        }>
+      )
+        .map((row) => row.detail)
+        .join(" | ");
+
+    // findByIds: the `id` primary key, which is the difference between a lookup
+    // and a table scan over every row in the collection.
+    expect(
+      plan(`SELECT id, doc FROM "members" WHERE ${compileMembership("id", "IN")}`, [
+        encodeMembershipList(["m_1", "m_2"], "test"),
+      ]),
+    ).toMatch(/SEARCH members USING (INDEX sqlite_autoindex_members_1|PRIMARY KEY) \(id=\?\)/);
+
+    // `in` over a declared index on a json_extract expression, which is the
+    // other index this path has to keep usable.
+    const membership = compileWhere({ tag: { in: ["t_1", "t_2"] } });
+    expect(
+      plan(`SELECT id, doc FROM "members" ${membership.sql}`, membership.parameters),
+    ).toMatch(/SEARCH members USING INDEX idx_members_tag \(<expr>=\?\)/);
+
+    // Asserted as a property of this shape rather than assumed: the placeholder
+    // run it replaced resolved the same way, so the plan is not a regression the
+    // suite would otherwise only notice as a slowdown.
+    expect(
+      plan(`SELECT id, doc FROM "members" WHERE id IN (?, ?)`, ["m_1", "m_2"]),
+    ).toMatch(/SEARCH members USING (INDEX sqlite_autoindex_members_1|PRIMARY KEY) \(id=\?\)/);
+    expect(members.findByIds(["m_1", "m_2"]).map((member) => member.id)).toEqual(["m_1", "m_2"]);
+  });
+
+  test("a query per distinct list length retains nothing per length", () => {
+    const { members } = seeded(5);
+    const LIST_COUNT = 2_000;
+    // Ids past the seeded range, so the arms differ in list length and in
+    // nothing else — every call parses the same zero rows through Zod. Every
+    // list the sweep uses is built once and held, before anything is measured:
+    // building 2 000 lists of 2 000 different sizes *inside* a measured arm is
+    // allocator churn that swamps the signal, and it is not what the arms
+    // disagree about.
+    const pool = Array.from({ length: LIST_COUNT }, (_unused, index) => `m_${1_000 + index}`);
+    const lists = Array.from({ length: LIST_COUNT }, (_unused, index) =>
+      pool.slice(0, index + 1),
+    );
+    const residentBytes = () => {
+      Bun.gc(true);
+      return process.memoryUsage().rss;
+    };
+    const measure = (arm: (list: string[]) => void, pick: (index: number) => string[]) => {
+      const before = residentBytes();
+      for (let index = 0; index < LIST_COUNT; index += 1) arm(pick(index));
+      return (residentBytes() - before) / 1024 / 1024;
+    };
+    const throughFind = (list: string[]) => {
+      members.find({ where: { id: { in: list } } });
+    };
+    const throughFindByIds = (list: string[]) => {
+      members.findByIds(list);
+    };
+    const fullLength = lists[LIST_COUNT - 1] as string[];
+
+    // The same warmup discipline F024 records, and for the same reason: RSS
+    // tracks a high-water mark, so an unwarmed first arm charges one-time arena
+    // growth to whichever loop runs first. The warmup is at the *full* length on
+    // purpose — warming over the varying sweep would pre-cache every statement
+    // the defect mints and let a broken build measure as clean.
+    for (let index = 0; index < LIST_COUNT; index += 1) throughFind(fullLength);
+    for (let index = 0; index < LIST_COUNT; index += 1) throughFindByIds(fullLength);
+    // One discarded control pass on top of it. RSS is still shedding the
+    // warmup's garbage when the warmup ends, so a control measured straight
+    // after it reads about -18 MB — a *negative* baseline that silently spends
+    // the slack the varying arms are judged against.
+    measure(throughFind, () => fullLength);
+
+    const fixedArityMegabytes = measure(throughFind, () => fullLength);
+    // `find` before `findByIds`, and the order is load-bearing rather than
+    // arbitrary. RSS is a high-water mark, so whichever varying arm runs first
+    // reports its retention truthfully and the second reports only what it adds
+    // on top — measured the other way round, a `find` that retains 250 MB leaves
+    // the `findByIds` arm reading a negative number on a build where both are
+    // broken. In this order each arm still fails on a regression confined to its
+    // own path: with only `findByIds` reverted, that arm measures ~125 MB while
+    // `find` stays inside the slack.
+    const varyingFindMegabytes = measure(throughFind, (index) => lists[index] as string[]);
+    const varyingFindByIdsMegabytes = measure(
+      throughFindByIds,
+      (index) => lists[index] as string[],
+    );
+
+    // A/B measured over this exact loop with only the membership compilation
+    // swapped. A placeholder per element: ~240 MB on the `find` arm and ~125 MB
+    // on the `findByIds` arm, against a ~0.5 MB control — one statement per
+    // length, never released, and quadratic because each is proportional to its
+    // arity. Bound as one JSON array: ~15 MB and ~2 MB, which is the allocator
+    // churn of encoding 2 000 differently-sized lists rather than retention. The
+    // slack sits between the two, and the comparison is against the control
+    // rather than an absolute ceiling, so a bigger machine cannot pass a leaking
+    // build.
+    expect(varyingFindMegabytes).toBeLessThan(fixedArityMegabytes + 48);
+    expect(varyingFindByIdsMegabytes).toBeLessThan(fixedArityMegabytes + 48);
+    // Seven sweeps of 2 000 calls and six full `Bun.gc(true)` collections: ~3.5 s
+    // on a developer machine and ~6.8 s on the GitHub runner, which is past Bun's
+    // implicit 5 000 ms per-test default. The bound is declared rather than
+    // inherited, because the alternative — a shorter sweep — moves the numbers the
+    // 48 MB slack above was calibrated against, and the arms are compared to a
+    // control rather than to wall-clock, so a slow runner cannot pass a leaking
+    // build. 30 s is headroom over the measured runner cost, not a target.
+  }, 30_000);
+});
+
 // F010 — find() with no limit selected every matching row and parsed each one
 // through Zod into memory, with no ceiling and no warning.
 describe("the find() result ceiling (F010)", () => {
@@ -1908,10 +2325,11 @@ describe("compileWhere — unit", () => {
     expect(() => compileWhere({ name: { contains: null } })).toThrow(
       /Operator "contains" expects a string operand, got null/,
     );
-    // A well-formed list is untouched, empty one included.
+    // A well-formed list is untouched, empty one included. The list binds as one
+    // JSON array parameter rather than a placeholder per element (F027).
     expect(compileWhere({ age: { in: [1, 2] } })).toEqual({
-      sql: "WHERE json_extract(doc, '$.age') IN (?, ?)",
-      parameters: [1, 2],
+      sql: "WHERE json_extract(doc, '$.age') IN (SELECT value FROM json_each(?))",
+      parameters: ["[1,2]"],
     });
     expect(compileWhere({ age: { notIn: [] } })).toEqual({ sql: "WHERE 1", parameters: [] });
   });
@@ -1923,8 +2341,8 @@ describe("compileWhere — unit", () => {
       parameters: ["mine"],
     });
     expect(compileWhere({ nickname: { notIn: ["mine", "yours"] } })).toEqual({
-      sql: `WHERE (${nickname} IS NULL OR ${nickname} NOT IN (?, ?))`,
-      parameters: ["mine", "yours"],
+      sql: `WHERE (${nickname} IS NULL OR ${nickname} NOT IN (${MEMBERSHIP_SOURCE}))`,
+      parameters: [`["mine","yours"]`],
     });
     // The parentheses are load-bearing, because every combinator nests this
     // predicate: `AND` binds tighter than `OR`, so an unparenthesised compound
@@ -1962,12 +2380,12 @@ describe("compileWhere — unit", () => {
     // A mixed list binds only the comparable values; the null is carried by the
     // IS NULL test, because no row equals a bound NULL.
     expect(compileWhere({ nickname: { in: ["mine", null] } })).toEqual({
-      sql: `WHERE (${nickname} IS NULL OR ${nickname} IN (?))`,
-      parameters: ["mine"],
+      sql: `WHERE (${nickname} IS NULL OR ${nickname} IN (${MEMBERSHIP_SOURCE}))`,
+      parameters: [`["mine"]`],
     });
     expect(compileWhere({ nickname: { notIn: ["mine", null] } })).toEqual({
-      sql: `WHERE (${nickname} IS NOT NULL AND ${nickname} NOT IN (?))`,
-      parameters: ["mine"],
+      sql: `WHERE (${nickname} IS NOT NULL AND ${nickname} NOT IN (${MEMBERSHIP_SOURCE}))`,
+      parameters: [`["mine"]`],
     });
     // The empty list still decides without comparing: no rows, every row.
     expect(compileWhere({ nickname: { in: [] } })).toEqual({ sql: "WHERE 0", parameters: [] });
@@ -2059,8 +2477,14 @@ describe("compileWhere — unit", () => {
       ["gte", { sql: `WHERE ${field} >= ?`, parameters: ["x"] }],
       ["lt", { sql: `WHERE ${field} < ?`, parameters: ["x"] }],
       ["lte", { sql: `WHERE ${field} <= ?`, parameters: ["x"] }],
-      ["in", { sql: `WHERE ${field} IN (?)`, parameters: ["x"] }],
-      ["notIn", { sql: `WHERE (${field} IS NULL OR ${field} NOT IN (?))`, parameters: ["x"] }],
+      ["in", { sql: `WHERE ${field} IN (${MEMBERSHIP_SOURCE})`, parameters: [`["x"]`] }],
+      [
+        "notIn",
+        {
+          sql: `WHERE (${field} IS NULL OR ${field} NOT IN (${MEMBERSHIP_SOURCE}))`,
+          parameters: [`["x"]`],
+        },
+      ],
       ["like", { sql: `WHERE ${field} LIKE ? ESCAPE '\\'`, parameters: ["x"] }],
       ["contains", { sql: `WHERE ${field} LIKE ? ESCAPE '\\'`, parameters: ["%x%"] }],
       ["startsWith", { sql: `WHERE ${field} LIKE ? ESCAPE '\\'`, parameters: ["x%"] }],
@@ -2388,27 +2812,612 @@ describe("the write gate", () => {
       expect(keyed.insert({ key: "k_1", ownerId: "user_a" }).title).toBe("");
     });
 
-    // The walk is one level deep by design: a nested object must itself declare
-    // a default, but its members are not checked. This pins that boundary so the
-    // limit stays a known one rather than an assumed fix.
-    test("the walk is one level deep — a nested member without a default is not caught", () => {
+    // F044 — the exemption was carried by the schema *object* `ref()` returned,
+    // held in a WeakSet. Zod schemas are immutable, so every chained method
+    // returns a new object the set does not hold, and the ordinary shape of an
+    // optional relation was refused with a message naming the exemption it was
+    // refusing to grant. `.describe()` was refused too, though it changes
+    // nothing about the field. Both ways out were wrong: a `.default(null)` on a
+    // foreign key is a fabricated reference, and `{ enforceDefaults: false }`
+    // takes the rule off every other field on the table.
+    test("a ref() keeps the exemption through a wrapper (F044)", () => {
       const store = createStore();
-      const nested = store.collection(
-        "nested",
+      const posts = store.collection(
+        "posts",
         z.object({
-          id: ref("n"),
-          meta: z.object({ note: z.string().optional() }).default({}),
+          id: ref("post"),
+          authorId: ref("user").nullable(),
+          editorId: ref("user").optional(),
+          reviewerId: ref("user").describe("who signed it off").nullable(),
+          approverId: ref("user").refine(() => true).nullable(),
+          title: z.string().default(""),
         }),
       );
-      nested.insert({ id: "n_1" });
-      // The known limit: `note` is dropped from storage exactly as F015 describes,
-      // one level down. Recursing would need Zod internals to unwrap `.default()`,
-      // which `hasDeclaredDefault` deliberately avoids for the ^3 || ^4 peer range.
-      expect(storedText(store, "nested", "n_1")).toBe('{"id":"n_1","meta":{}}');
-      // The nested object itself is still held to the rule.
+      expect(
+        posts.insert({ id: "post_1", authorId: null, reviewerId: null, approverId: null }),
+      ).toEqual({
+        id: "post_1",
+        authorId: null,
+        reviewerId: null,
+        approverId: null,
+        title: "",
+      });
+      // The explicit null round-trips through storage as itself.
+      expect(posts.get("post_1")?.authorId).toBe(null);
+      expect(storedText(store, "posts", "post_1")).toContain('"authorId":null');
+      // A populated reference still validates on the way in.
       expect(() =>
-        store.collection("nested2", z.object({ id: ref("n"), meta: z.object({}) })),
-      ).toThrow(/field "meta" has no default/);
+        posts.insert({ id: "post_2", authorId: "nope_1", reviewerId: null, approverId: null }),
+      ).toThrow();
+    });
+
+    // The other half of F044: a fix that unwraps too eagerly exempts every
+    // nullable field and closes the guard instead of the gap. Only a reference
+    // is identity-shaped — an ordinary field wrapped the same way is not.
+    test("an ordinary field wrapped the same way is still refused (F044)", () => {
+      const store = createStore();
+      for (const wrapper of ["nullable", "optional", "describe", "readonly"] as const) {
+        const note =
+          wrapper === "describe" ? z.string().describe("a note") : z.string()[wrapper]();
+        expect(
+          () => store.collection("opts", z.object({ id: ref("o"), note })),
+          `note wrapped in .${wrapper}()`,
+        ).toThrow(/field "note" has no default/);
+      }
+    });
+
+    // The boundary the exemption stops at, stated in ref()'s JSDoc: a default on
+    // a foreign key invents a reference to a row that may not exist, so such a
+    // field is no longer identity-shaped. It is accepted on the ordinary rule
+    // instead — it declares a default — rather than through the exception.
+    test("a ref() with a default is held to the ordinary rule, and passes it", () => {
+      const store = createStore();
+      const rows = store.collection(
+        "assignments",
+        z.object({ id: ref("a"), ownerId: ref("user").default("user_unassigned") }),
+      );
+      expect(rows.insert({ id: "a_1" }).ownerId).toBe("user_unassigned");
+    });
+
+    // F020 — the guard read `schema.shape` directly and treated an absent
+    // `.shape` as "nothing to enforce". That is true of `z.string()`; it is not
+    // true of an object schema under a wrapper, which has fields and no
+    // `.shape`, so the rule that makes "no migrations" true switched itself off
+    // without saying so on the exact shape the write gate invites.
+    test("a wrapped object schema is walked exactly like the bare one (F020)", () => {
+      const bare = () => z.object({ id: ref("o"), note: z.string().optional() });
+      const wrapped = {
+        transform: bare().transform((document) => document),
+        pipe: bare().pipe(bare()),
+        brand: bare().brand<"Doc">(),
+        default: bare().default({ id: "o_1" }),
+        readonly: bare().readonly(),
+        lazy: z.lazy(bare),
+        "nullable.transform": bare().transform((document) => document).nullable(),
+      };
+      for (const [label, schema] of Object.entries(wrapped)) {
+        const store = createStore();
+        expect(
+          () => store.collection("opts", schema as unknown as z.ZodType),
+          `wrapped in .${label}()`,
+        ).toThrow(/field "note" has no default/);
+      }
+    });
+
+    // The deliberate half of F020: "declares no fields" and "declares fields I
+    // cannot read as one shape" used to be the same answer — skip — so a union
+    // of two object schemas was waved through on the same terms as `z.string()`.
+    // The second answer is now a refusal, because enforcing nothing there is a
+    // rule reporting a check it never ran.
+    test("a schema whose fields are not one shape is refused, not skipped (F020)", () => {
+      const store = createStore();
+      const draft = z.object({ id: ref("d"), kind: z.literal("draft").default("draft") });
+      const final = z.object({ id: ref("d"), kind: z.literal("final").default("final") });
+      const unreadable = {
+        union: z.union([draft, final]),
+        discriminatedUnion: z.discriminatedUnion("kind", [draft, final]),
+        intersection: z.intersection(draft, z.object({ note: z.string().optional() })),
+        "wrapped union": z.union([draft, final]).transform((document) => document),
+      };
+      for (const [label, schema] of Object.entries(unreadable)) {
+        expect(
+          () => store.collection("variants", schema as unknown as z.ZodType),
+          label,
+        ).toThrow(/fields cannot be read as one shape/);
+        // The message names the way past it, and it is the caller's to take.
+        expect(() =>
+          store.collection("variants", schema as unknown as z.ZodType, {
+            enforceDefaults: false,
+          }),
+        ).not.toThrow();
+      }
+      // A union that declares no fields at all declares nothing to enforce, and
+      // is skipped like any other shapeless schema.
+      expect(() =>
+        store.collection("scalars", z.union([z.string(), z.number()])),
+      ).not.toThrow();
+    });
+
+    // Both guards read the schema through the same helper, and the two peer
+    // majors keep a wrapper's inner schema under different keys — Zod 4 pipes a
+    // `.transform()` through `in`, Zod 3 wraps it in a `ZodEffects` — so the
+    // reach is proved on both rather than reasoned about on one.
+    test("the wrapped schema is walked under the older declared peer major too", () => {
+      const store = createStore();
+      const legacy = zodThree
+        .object({ id: zodThree.string(), note: zodThree.string().optional() })
+        .transform((document) => document) as unknown as z.ZodType;
+      expect(() => store.collection("legacy", legacy)).toThrow(/field "note" has no default/);
+
+      const legacyReserved = zodThree
+        .object({ id: zodThree.string(), NOT: zodThree.string().default("") })
+        .transform((document) => document) as unknown as z.ZodType;
+      expect(() => store.collection("legacy", legacyReserved)).toThrow(
+        /field "NOT" is a reserved where-clause key/,
+      );
+
+      // Zod 3 keeps a pipe's two sides on a `ZodPipeline`, Zod 4 on a `ZodPipe`;
+      // the far side is read on both.
+      const legacyPiped = zodThree
+        .object({ id: zodThree.string(), value: zodThree.string().default("") })
+        .pipe(
+          zodThree.object({
+            id: zodThree.string(),
+            value: zodThree.string(),
+            NOT: zodThree.string().default("x"),
+          }),
+        ) as unknown as z.ZodType;
+      expect(() => store.collection("legacy", legacyPiped)).toThrow(
+        /field "NOT" is a reserved where-clause key/,
+      );
+
+      const legacyBranded = zodThree
+        .object({ id: zodThree.string(), note: zodThree.string().optional() })
+        .brand<"Doc">() as unknown as z.ZodType;
+      expect(() => store.collection("legacy", legacyBranded)).toThrow(
+        /field "note" has no default/,
+      );
+
+      // And the same schema with every field declared still opens.
+      const sound = zodThree
+        .object({ id: zodThree.string(), note: zodThree.string().default("") })
+        .transform((document) => document) as unknown as z.ZodType;
+      expect(store.collection("legacy", sound).insert({ id: "r_1" })).toEqual({
+        id: "r_1",
+        note: "",
+      });
+    });
+
+    // F048 (#11) — the walk read one shape and stopped, so a member nested
+    // inside a defaulted object was never asked for a default of its own. The
+    // parent's `.default(…)` does not cover it: a row that already stores the
+    // object is parsed against every member of it, so the extension below made
+    // every row written before it unreadable — in production, on the first read
+    // of one particular old row, rather than here where the schema was written.
+    // This is the test that used to pin the depth-1 limit, inverted.
+    test("a nested member without a default is refused, naming the full path (F048)", () => {
+      const store = createStore();
+      const version1 = z.object({
+        id: ref("s"),
+        settings: z.object({ theme: z.string().default("light") }).default({ theme: "light" }),
+      });
+      store.collection("s", version1).insert({ id: "s_old" });
+      expect(storedText(store, "s", "s_old")).toBe('{"id":"s_old","settings":{"theme":"light"}}');
+
+      const version2 = z.object({
+        id: ref("s"),
+        settings: z
+          .object({ theme: z.string().default("light"), fontSize: z.number() })
+          .default({ theme: "light", fontSize: 14 }),
+      });
+      expect(() => store.collection("s", version2)).toThrow(
+        /field "settings\.fontSize" has no default/,
+      );
+
+      // What that refusal stands in front of: with the rule taken off, the
+      // schema opens and the row written under version 1 no longer reads.
+      const unguarded = store.collection("s", version2, { enforceDefaults: false });
+      expect(() => unguarded.get("s_old")).toThrow(/does not match the current schema/);
+
+      // Recursion rather than a second level: one deeper again is the same refusal.
+      expect(() =>
+        store.collection(
+          "deep",
+          z.object({
+            id: ref("d"),
+            a: z
+              .object({ b: z.object({ c: z.string() }).default({ c: "" }) })
+              .default({ b: { c: "" } }),
+          }),
+        ),
+      ).toThrow(/field "a\.b\.c" has no default/);
+    });
+
+    test("a nested object whose members all declare defaults is accepted (F048)", () => {
+      const store = createStore();
+      const profiles = store.collection(
+        "profiles",
+        z.object({
+          id: ref("p"),
+          settings: z
+            .object({
+              theme: z.string().default("light"),
+              layout: z.object({ columns: z.number().default(2) }).default({ columns: 2 }),
+            })
+            .default({ theme: "light", layout: { columns: 2 } }),
+        }),
+      );
+      expect(profiles.insert({ id: "p_1" })).toEqual({
+        id: "p_1",
+        settings: { theme: "light", layout: { columns: 2 } },
+      });
+    });
+
+    // The two exemptions do not travel together below the top level. A foreign
+    // key is identity-shaped wherever it sits; `idField` names the column this
+    // collection keys its rows by, which is a top-level concept, so a nested
+    // member that happens to share the name is an ordinary field (F048).
+    test("at depth a ref() stays exempt and a member named like the id field does not", () => {
+      const store = createStore();
+      const posts = store.collection(
+        "posts",
+        z.object({
+          id: ref("post"),
+          meta: z
+            .object({ ownerId: ref("user"), editorId: ref("user").nullable() })
+            .default({ ownerId: "user_a", editorId: null }),
+        }),
+      );
+      expect(posts.insert({ id: "post_1" }).meta).toEqual({
+        ownerId: "user_a",
+        editorId: null,
+      });
+
+      expect(() =>
+        store.collection(
+          "shadowed",
+          z.object({
+            id: ref("s"),
+            meta: z.object({ id: z.string() }).default({ id: "" }),
+          }),
+        ),
+      ).toThrow(/field "meta\.id" has no default/);
+    });
+
+    // A container mostly declares no fields of its own, but what it *stores* is
+    // parsed against a declared schema, so an old row's array element, tuple
+    // tail, record value or catchall key breaks on an added defaultless member
+    // exactly as a nested object does. Every way a stored value reaches a schema
+    // without a declared field name is enumerated here, because a shape missed
+    // is a shape the rule silently stops at — which is the whole of F048. The
+    // path names the container as the reader sees it.
+    test("the walk reaches what an array, a tuple and a record store (F048)", () => {
+      const store = createStore();
+      const gapped = () => z.object({ name: z.string().default(""), color: z.string() });
+      const containers: Array<{ path: string; member: z.ZodType }> = [
+        { path: "holder[].color", member: z.array(gapped()).default([]) },
+        { path: "holder[0].color", member: z.tuple([gapped()]).default([{ name: "", color: "" }]) },
+        // A tuple's `rest` tail stores an array's worth of one shape, and is a
+        // stored member the walk used to pass straight over.
+        {
+          path: "holder[].color",
+          member: z
+            .tuple([z.object({ name: z.string().default("") })], gapped())
+            .default([{ name: "" }]),
+        },
+        { path: "holder.<key>.color", member: z.record(z.string(), gapped()).default({}) },
+        // A `.catchall()` is the other one: an object parses every key it does
+        // not declare against a second schema, and stores what it parsed.
+        {
+          path: "holder.<key>.color",
+          member: z.object({}).catchall(gapped()).default({}),
+        },
+      ];
+      for (const { path, member } of containers) {
+        expect(
+          () => store.collection("containers", z.object({ id: ref("c"), holder: member })),
+          path,
+        ).toThrow(`field "${path}" has no default`);
+      }
+      // The same containers with every member declared are accepted, so the
+      // descent is into the gap and not into the container.
+      const sound = () => z.object({ name: z.string().default("") });
+      expect(() =>
+        store.collection(
+          "sound",
+          z.object({
+            id: ref("c"),
+            tags: z.array(sound()).default([]),
+            byKey: z.record(z.string(), sound()).default({}),
+            tail: z.tuple([sound()], sound()).default([{ name: "" }]),
+            bag: z.object({}).catchall(sound()).default({}),
+          }),
+        ),
+      ).not.toThrow();
+      // A container of scalars declares nothing to descend into, and neither
+      // does the catchall a caller writes to accept anything at all.
+      expect(() =>
+        store.collection(
+          "scalars",
+          z.object({
+            id: ref("c"),
+            tags: z.array(z.string()).default([]),
+            loose: z.object({ k: z.string().default("") }).catchall(z.unknown()).default({ k: "" }),
+          }),
+        ),
+      ).not.toThrow();
+    });
+
+    // The reproduction of F048 in the two shapes that were still silent after
+    // the walk first went recursive: an old row whose catchall value — or whose
+    // tuple tail — was written under a schema the extension then made
+    // unreadable. Both are refused at collection() now, at the member's path.
+    test("a catchall value and a tuple tail cannot strand an old row either (F048)", () => {
+      const store = createStore();
+      const catchallV1 = z.object({
+        id: ref("d"),
+        bag: z
+          .object({})
+          .catchall(z.object({ a: z.string().default("") }))
+          .default({}),
+      });
+      store.collection("bags", catchallV1).insert({ id: "d_1", bag: { extra: { a: "y" } } });
+      const catchallV2 = z.object({
+        id: ref("d"),
+        bag: z
+          .object({})
+          .catchall(z.object({ a: z.string().default(""), gap: z.number() }))
+          .default({}),
+      });
+      expect(() => store.collection("bags", catchallV2)).toThrow(
+        /field "bag\.<key>\.gap" has no default/,
+      );
+      // The row the refusal protects: with the rule off, it no longer reads.
+      expect(() =>
+        store.collection("bags", catchallV2, { enforceDefaults: false }).get("d_1"),
+      ).toThrow(/does not match the current schema/);
+
+      // An object that declares fields *and* a catchall is read as both: the
+      // declared members pass here, and the gap is found under the catchall.
+      expect(() =>
+        store.collection(
+          "mixedBags",
+          z.object({
+            id: ref("d"),
+            bag: z
+              .object({
+                k: z
+                  .object({ a: z.string().default(""), gap: z.number().default(0) })
+                  .default({ a: "", gap: 0 }),
+              })
+              .catchall(z.object({ a: z.string().default(""), gap: z.number() }))
+              .default({ k: { a: "", gap: 0 } }),
+          }),
+        ),
+      ).toThrow(/field "bag\.<key>\.gap" has no default/);
+
+      const tupleV1 = z.object({
+        id: ref("p"),
+        pair: z
+          .tuple([z.object({ a: z.string().default("") })], z.object({ a: z.string().default("") }))
+          .default([{ a: "" }]),
+      });
+      store.collection("pairs", tupleV1).insert({ id: "p_1", pair: [{ a: "x" }, { a: "y" }] });
+      const tupleV2 = z.object({
+        id: ref("p"),
+        pair: z
+          .tuple(
+            [z.object({ a: z.string().default("") })],
+            z.object({ a: z.string().default(""), gap: z.number() }),
+          )
+          .default([{ a: "" }]),
+      });
+      expect(() => store.collection("pairs", tupleV2)).toThrow(/field "pair\[\]\.gap" has no default/);
+      expect(() =>
+        store.collection("pairs", tupleV2, { enforceDefaults: false }).get("p_1"),
+      ).toThrow(/does not match the current schema/);
+    });
+
+    // A container is read through each peer major's internals — Zod 4 keeps an
+    // array's element under `element` and Zod 3 under `type`, and Zod 3's record
+    // exposes an `.element` that is its *value* schema — so the descent is proved
+    // on both majors rather than reasoned about on one (F048).
+    test("the nested walk reaches the same members under the older declared peer major", () => {
+      const store = createStore();
+      const legacyNested = zodThree.object({
+        id: zodThree.string(),
+        settings: zodThree
+          .object({ theme: zodThree.string().default("light"), fontSize: zodThree.number() })
+          .default({ theme: "light", fontSize: 14 }),
+      }) as unknown as z.ZodType;
+      expect(() => store.collection("legacy", legacyNested)).toThrow(
+        /field "settings\.fontSize" has no default/,
+      );
+
+      const legacyGapped = () => zodThree.object({ color: zodThree.string() });
+      const legacyContainers: Array<{ path: string; member: unknown }> = [
+        { path: "holder[].color", member: zodThree.array(legacyGapped()).default([]) },
+        {
+          // Zod 3 parses a `.default(…)` through the schema it defaults, so the
+          // value has to be a whole member — the gap is in the schema, not here.
+          path: "holder[0].color",
+          member: zodThree.tuple([legacyGapped()]).default([{ color: "" }]),
+        },
+        {
+          // Zod 3 spells a tuple's tail `.rest(…)` rather than as a second
+          // argument, and keeps it under the same `rest` key Zod 4 uses.
+          path: "holder[].color",
+          member: zodThree
+            .tuple([zodThree.object({ name: zodThree.string().default("") })])
+            .rest(legacyGapped())
+            .default([{}]),
+        },
+        {
+          path: "holder.<key>.color",
+          member: zodThree.record(zodThree.string(), legacyGapped()).default({}),
+        },
+        {
+          // Every Zod 3 object carries a catchall — `ZodNever` unless one is
+          // declared — so the reader has to tell "no catchall" from one that
+          // stores members, on the major where the key is always present.
+          path: "holder.<key>.color",
+          member: zodThree.object({}).catchall(legacyGapped()).default({}),
+        },
+      ];
+      for (const { path, member } of legacyContainers) {
+        const schema = zodThree.object({
+          id: zodThree.string(),
+          holder: member as never,
+        }) as unknown as z.ZodType;
+        expect(() => store.collection("legacy", schema), path).toThrow(
+          `field "${path}" has no default`,
+        );
+      }
+
+      // And the same shapes with every member declared still open.
+      const sound = zodThree.object({
+        id: zodThree.string(),
+        settings: zodThree
+          .object({ theme: zodThree.string().default("light") })
+          .default({ theme: "light" }),
+        tags: zodThree.array(zodThree.object({ name: zodThree.string().default("") })).default([]),
+      }) as unknown as z.ZodType;
+      expect(store.collection("legacySound", sound).insert({ id: "r_1" })).toEqual({
+        id: "r_1",
+        settings: { theme: "light" },
+        tags: [],
+      });
+    });
+
+    // Where the walk stops, on purpose: a `z.map()` and a `z.set()` hold values
+    // this library can read, and are skipped anyway — neither survives the write
+    // gate's JSON round-trip (F003), so no such field ever reaches storage and
+    // there is no stored member to read forward. The skip is asserted here so it
+    // stays a decision rather than becoming the next rediscovered limit (F048).
+    test("a z.map() and a z.set() are not walked into — the write gate refuses them first", () => {
+      const store = createStore();
+      const rooms = store.collection(
+        "rooms",
+        z.object({
+          id: ref("r"),
+          // `name` has no default, and is not reported: the walk does not enter here.
+          occupants: z
+            .map(z.string(), z.object({ name: z.string() }))
+            .default(new Map()) as unknown as z.ZodType,
+          seats: z.set(z.object({ name: z.string() })).default(new Set()) as unknown as z.ZodType,
+        }),
+      );
+      expect(() => rooms.insert({ id: "r_1" } as never)).toThrow(
+        /does not survive a JSON round-trip/,
+      );
+      expect(rooms.count()).toBe(0);
+    });
+
+    // The F020 refusal, one level down: "declares no fields" and "declares
+    // fields I cannot read as one shape" stay two answers at depth too, and the
+    // second is refused rather than enforced-nothing — naming the field, so the
+    // caller is not left bisecting the schema for it (F048).
+    test("a nested union is refused like a top-level one, naming the field (F048)", () => {
+      const store = createStore();
+      const block = z
+        .union([
+          z.object({ kind: z.literal("text").default("text"), text: z.string().default("") }),
+          z.object({ kind: z.literal("image").default("image"), url: z.string().default("") }),
+        ])
+        .default({ kind: "text", text: "" });
+      const pages = z.object({ id: ref("p"), block });
+      expect(() => store.collection("pages", pages)).toThrow(
+        /field "block" declares fields that cannot be read as one shape/,
+      );
+      expect(() =>
+        store.collection("pages", pages, { enforceDefaults: false }),
+      ).not.toThrow();
+      // A nested union that declares no fields at all is skipped, exactly as at
+      // the top level.
+      expect(() =>
+        store.collection(
+          "mixed",
+          z.object({ id: ref("m"), value: z.union([z.string(), z.number()]).default("") }),
+        ),
+      ).not.toThrow();
+    });
+
+    // Where the walk stops, on purpose: a shape it has already walked is not
+    // walked again, which is what lets a self-referential schema terminate.
+    test("a self-referential schema terminates and is still enforced (F048)", () => {
+      const store = createStore();
+      // Annotated, because the schema names itself in its own initializer — the
+      // shape the walk has to terminate on.
+      const CategorySchema: z.ZodType = z.object({
+        id: ref("cat"),
+        name: z.string().default(""),
+        children: z.lazy(() => z.array(CategorySchema)).default([]),
+      });
+      const categories = store.collection("categories", CategorySchema);
+      expect(categories.insert({ id: "cat_1" })).toEqual({
+        id: "cat_1",
+        name: "",
+        children: [],
+      });
+
+      // The cycle does not buy an exemption for the members reached through it:
+      // the same schema with a gap is refused, at the path the gap sits at.
+      const GappedSchema: z.ZodType = z.object({
+        id: ref("cat"),
+        meta: z.object({ slug: z.string() }).default({ slug: "" }),
+        children: z.lazy(() => z.array(GappedSchema)).default([]),
+      });
+      expect(() => store.collection("gapped", GappedSchema)).toThrow(
+        /field "meta\.slug" has no default/,
+      );
+
+      // And the `idField` exemption does not travel around the cycle either: the
+      // collection's own shape is the one walked under it, so the same shape
+      // reached again one level in holds a plain-string `id` to the rule. A
+      // recursive document declares its identity with ref(), which is exempt at
+      // any depth — CategorySchema above does, and opens.
+      const PlainIdSchema: z.ZodType = z.object({
+        id: z.string(),
+        children: z.lazy(() => z.array(PlainIdSchema)).default([]),
+      });
+      expect(() => store.collection("plain", PlainIdSchema)).toThrow(
+        /field "children\[\]\.id" has no default/,
+      );
+    });
+
+    // And where it stops when nothing else can stop it: a `z.lazy()` may hand
+    // back a *fresh* schema on every call, which no shape-identity check
+    // catches, so the walk is bounded — and refuses at the bound rather than
+    // enforcing nothing past it (F048).
+    test("nesting past the walk's bound is refused, not skipped (F048)", () => {
+      const store = createStore();
+      let nested: z.ZodType = z.object({ leaf: z.string().default("") });
+      for (let level = 0; level < 12; level += 1) {
+        nested = z.object({ nested: nested.default({} as never) });
+      }
+      const schema = z.object({ id: ref("x"), nested: nested.default({} as never) });
+      expect(() => store.collection("towers", schema)).toThrow(/nests more than \d+ levels deep/);
+      expect(() => store.collection("towers", schema, { enforceDefaults: false })).not.toThrow();
+
+      // The case the bound exists for, rather than a hand-built tower: a
+      // `z.lazy()` whose body *builds* the object returns a fresh shape on every
+      // call, so the memo never recognises it. It is refused in milliseconds at
+      // the bound — where the same schema with the `lazy` around the reference
+      // (`children: z.lazy(() => z.array(Node))`, above) is walked once and
+      // accepted. That difference is the caller's to know, so it is in README.md.
+      const FreshEachCall: z.ZodType = z.lazy(() =>
+        z.object({
+          id: ref("n"),
+          name: z.string().default(""),
+          kids: z.array(FreshEachCall).default([]),
+        }),
+      );
+      expect(() =>
+        store.collection(
+          "nodes",
+          z.object({ id: ref("n"), root: z.array(FreshEachCall).default([]) }),
+        ),
+      ).toThrow(/nests more than \d+ levels deep/);
     });
 
     test("the check is escapable and skips a non-object schema", () => {
@@ -2419,9 +3428,12 @@ describe("the write gate", () => {
         { enforceDefaults: false },
       );
       expect(loose.insert({ id: "l_1" })).toEqual({ id: "l_1" });
-      // A schema with no shape to walk is skipped rather than refused.
+      // A schema that declares no fields at all is skipped rather than refused —
+      // the answer that stayed unchanged when F020 split it from "declares
+      // fields I cannot read".
       const records = store.collection("records", z.record(z.string(), z.string()));
       expect(records.insert({ id: "r_1", note: "kept" }).note).toBe("kept");
+      expect(() => store.collection("scalars", z.string())).not.toThrow();
     });
   });
 

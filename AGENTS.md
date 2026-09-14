@@ -106,6 +106,7 @@ src/
   collection.ts  createCollection: one table per collection, the Zod gate on every read/write
   cross-store.ts transactionAcross: one transaction over several stores, via ATTACH
   query.ts       where/orderBy/limit compilation to SQL + bound parameters
+  schema-shape.ts the fields a schema declares, read through its wrappers, on both peer majors
   types.ts       the typed query shapes (plain TS — assembled in-process, never re-entered)
   populate.ts    batched join over findByIds
   ref.ts         ref(prefix) — typed foreign-key schema helper

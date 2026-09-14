@@ -230,6 +230,77 @@ function toSqlParameter(value: unknown, context: string): SqlParameter {
 }
 
 /**
+ * The JSON text SQLite's parser reads back as `+Infinity` and `-Infinity`.
+ *
+ * `JSON.stringify` has no spelling for a non-finite number — it emits `null` —
+ * and `toSqlParameter` passes both infinities deliberately, so a list carrying
+ * one cannot be serialised naively. The consequence would not be a near miss: a
+ * `null` inside the array a `NOT IN` reads makes that predicate unknown for
+ * every row, turning `notIn: [Infinity]` from "every row" into "no row". An
+ * out-of-range exponent is well-formed JSON, SQLite parses it to the REAL
+ * infinity, and that value compares equal to a bound `Infinity` — so the list
+ * survives the round trip with the membership answers it had as placeholders.
+ */
+const POSITIVE_INFINITY_JSON = "1e999";
+const NEGATIVE_INFINITY_JSON = `-${POSITIVE_INFINITY_JSON}`;
+
+/**
+ * The membership test over `expression`, against a list bound as **one** JSON
+ * array parameter rather than one placeholder per element (F027).
+ *
+ * A placeholder per element put the element *count* in the SQL text, so `in`
+ * over three values and `in` over four were two different statements — and
+ * `bun:sqlite` caches a prepared statement per distinct SQL string, with no
+ * eviction, for the life of the `Database`. The list length is what an endpoint
+ * forwards from `?ids=a,b,c`, so the cardinality of that cache was the caller's
+ * to choose, and the cost is quadratic in the longest list seen: each retained
+ * statement is itself proportional to its arity. One statement per operator now
+ * covers every length, which also puts the list past the bound on how many
+ * parameters a statement may carry — 65 535 on the SQLite Bun ships, measured
+ * rather than assumed — since it binds as one parameter however long it is.
+ *
+ * The plan is the reason this shape is usable rather than merely tidy, and it
+ * was measured before being chosen: `EXPLAIN QUERY PLAN` reports the same
+ * `SEARCH … USING INDEX (id=?)` for the subquery form as for the placeholder
+ * form, on the `id` primary key and on a declared `json_extract` expression
+ * index alike. The suite asserts it, because the difference between this and a
+ * table scan is one planner decision.
+ */
+export function compileMembership(expression: string, keyword: "IN" | "NOT IN"): string {
+  return `${expression} ${keyword} (SELECT value FROM json_each(?))`;
+}
+
+/**
+ * Serialise a list into the single parameter {@link compileMembership}'s
+ * placeholder binds. Every element goes through `toSqlParameter` first, so the
+ * bound array holds exactly the values the placeholder form bound, in the same
+ * order and with the same refusals — a `Date` as its ISO string, a boolean as
+ * `1`/`0`, `NaN` named as the mistake it is.
+ *
+ * This is still a bound parameter and not SQL: the array is one TEXT value
+ * SQLite parses, so no element can reach the statement text however it is
+ * spelled.
+ *
+ * Appended rather than mapped-and-joined because the intermediate array is the
+ * larger allocation of the two on a long list, and this runs once per query on
+ * lists whose length the caller chooses.
+ */
+export function encodeMembershipList(values: readonly unknown[], context: string): string {
+  let encoded = "[";
+  for (let index = 0; index < values.length; index += 1) {
+    if (index > 0) encoded += ",";
+    const parameter = toSqlParameter(values[index], context);
+    encoded +=
+      typeof parameter === "number" && !Number.isFinite(parameter)
+        ? parameter > 0
+          ? POSITIVE_INFINITY_JSON
+          : NEGATIVE_INFINITY_JSON
+        : JSON.stringify(parameter);
+  }
+  return `${encoded}]`;
+}
+
+/**
  * Whether a field's condition is an operator object rather than a document value
  * compared for equality. Two tests, and both carry weight: the condition is a
  * **plain** object, and every key it has names an operator. The second is what
@@ -342,9 +413,11 @@ function compileOperator(
         );
         return;
       }
-      const placeholders = comparableValues.map(() => "?").join(", ");
-      const keyword = operator === "in" ? "IN" : "NOT IN";
-      const membership = `${expression} ${keyword} (${placeholders})`;
+      // The comparable values travel as one bound JSON array, so the statement
+      // is the same whatever the list's length (F027). The null-bearing forms
+      // below are the second axis the same cache keys on, and they inherit the
+      // property: two statements per operator now cover every list.
+      const membership = compileMembership(expression, operator === "in" ? "IN" : "NOT IN");
       if (operator === "in") {
         conditions.push(
           namesTheAbsence ? `(${expression} IS NULL OR ${membership})` : membership,
@@ -359,9 +432,7 @@ function compileOperator(
             : `(${expression} IS NULL OR ${membership})`,
         );
       }
-      for (const value of comparableValues) {
-        parameters.push(toSqlParameter(value, `operator "${operator}"`));
-      }
+      parameters.push(encodeMembershipList(comparableValues, `operator "${operator}"`));
       return;
     }
     case "like":
