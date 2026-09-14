@@ -12,25 +12,55 @@ export interface CompiledClause {
   parameters: SqlParameter[];
 }
 
-const KNOWN_OPERATORS = new Set<keyof FieldOperators<unknown>>([
-  "eq",
-  "ne",
-  "gt",
-  "gte",
-  "lt",
-  "lte",
-  "in",
-  "notIn",
-  "like",
-  "contains",
-  "startsWith",
-  "endsWith",
-  "isNull",
-]);
+/**
+ * Every operator the where-grammar declares, as a record **keyed by
+ * `FieldOperators`** — which is what couples the two (F050). An operator added
+ * to that interface and forgotten here is a missing property, so `tsc` names it;
+ * before, the two lists were related only by the set's type parameter, which
+ * catches a typo and not an omission. `KNOWN_OPERATORS` is derived from it
+ * rather than written out beside it, because a second literal list in the same
+ * file is the same defect at a shorter distance.
+ */
+const OPERATOR_NAMES: Record<keyof FieldOperators<unknown>, true> = {
+  eq: true,
+  ne: true,
+  gt: true,
+  gte: true,
+  lt: true,
+  lte: true,
+  in: true,
+  notIn: true,
+  like: true,
+  contains: true,
+  startsWith: true,
+  endsWith: true,
+  isNull: true,
+};
 
-/** The reserved `where` keys that combine clauses instead of naming a field. */
-const OR_KEY = "OR";
-const NOT_KEY = "NOT";
+const KNOWN_OPERATORS: ReadonlySet<string> = new Set(Object.keys(OPERATOR_NAMES));
+
+/**
+ * The reserved `where` keys that combine clauses instead of naming a field.
+ *
+ * One declaration, because two files have to agree about it (F051). The
+ * constants `compileConditions` branches on are read out of this list, and
+ * {@link RESERVED_WHERE_KEYS} is the same list as a set — so a combinator added
+ * here reaches `createCollection`'s schema guard without anybody remembering to
+ * edit a second literal in a second file. A field name that shadows a
+ * combinator can never be filtered on, so that guard is what keeps the
+ * shadowing from surfacing as a silently mis-compiled filter, and it used to be
+ * correct only for as long as the two lists happened to agree.
+ */
+const COMBINATOR_KEYS = ["OR", "NOT"] as const;
+const [OR_KEY, NOT_KEY] = COMBINATOR_KEYS;
+
+/**
+ * The `where` keys that name a combinator rather than a document field. Read by
+ * `src/collection.ts`, which refuses a schema declaring a field of the same
+ * name. Internal to the library: `src/index.ts` does not re-export it, because
+ * it describes this module's grammar rather than the library's surface.
+ */
+export const RESERVED_WHERE_KEYS: ReadonlySet<string> = new Set(COMBINATOR_KEYS);
 
 const FIELD_PATH_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 
@@ -68,6 +98,44 @@ function readPatternOperand(operator: string, operand: unknown): string {
     );
   }
   return escapeLikeOperand(operand);
+}
+
+/**
+ * Read an `isNull` operand, which must be the `boolean` `FieldOperators`
+ * declares — not merely something JavaScript calls truthy (F046).
+ *
+ * The branch this guards is a ternary, so every truthy operand used to select
+ * `IS NULL` and every falsy one `IS NOT NULL`. `isNull: "false"` — what a query
+ * string yields for `?isNull=false` before anything parses it — therefore
+ * returned exactly the rows `isNull: false` was asked to exclude, and on
+ * `deleteMany` deleted the complement of what the caller named. An operator that
+ * inverts under a type the language calls truthy is worse than one that throws.
+ */
+function readBooleanOperand(operator: string, operand: unknown): boolean {
+  if (typeof operand !== "boolean") {
+    throw new Error(
+      `Operator "${operator}" expects a boolean operand, got ${describeOperand(operand)}`,
+    );
+  }
+  return operand;
+}
+
+/**
+ * Read a `gt`/`gte`/`lt`/`lte` operand, which must name a value to order
+ * against. `null` is not one (F046): every SQL range comparison against `NULL`
+ * evaluates to unknown rather than true, and a `WHERE` keeps only what is true,
+ * so `gt: null` compiled to a `> ?` that matched no row and said nothing about
+ * why — an empty answer indistinguishable from a truthful one.
+ */
+function readOrderedOperand(operator: string, operand: unknown): unknown {
+  if (operand === null) {
+    throw new Error(
+      `Operator "${operator}" expects a value to order against, got null: a range ` +
+        `comparison against no value has no answer — use "isNull" or "eq: null" ` +
+        `to name the rows that have no value`,
+    );
+  }
+  return operand;
 }
 
 /** Read an `in`/`notIn` operand, which must be a list of values. */
@@ -115,6 +183,17 @@ export function jsonExtract(fieldPath: string): string {
  * rather than left to `toISOString()`'s opaque `RangeError`. `context` names
  * the operator or field at fault, because a `where` can carry several date
  * conditions and a message that names none of them makes the caller bisect.
+ *
+ * `NaN` is refused for the same stated reason as an invalid `Date`, and it is
+ * the number `Number(badQueryParam)` produces (F046): `bun:sqlite` binds it as
+ * SQL `NULL`, every comparison against `NULL` is unknown, and the filter then
+ * returns an empty answer no caller can tell apart from a truthful one.
+ * **`Infinity` and `-Infinity` pass**, decided rather than inherited: they bind
+ * as REAL and order against every stored number, so `lt: Infinity` is the
+ * working "any number" filter it looks like, and refusing it would remove a
+ * query that answers correctly rather than a way to spell a mistake. Neither is
+ * ever a *stored* value — `JSON.stringify` maps every non-finite number to
+ * `null`, which is why the write gate's round-trip check refuses to store one.
  */
 function toSqlParameter(value: unknown, context: string): SqlParameter {
   if (typeof value === "boolean") return value ? 1 : 0;
@@ -133,7 +212,16 @@ function toSqlParameter(value: unknown, context: string): SqlParameter {
     }
     return isoForm;
   }
-  if (value === null || typeof value === "string" || typeof value === "number") {
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) {
+      throw new Error(
+        `Invalid number operand for ${context}: NaN denotes no value to compare against, ` +
+          `so every comparison it reaches is unknown and the filter can only answer nothing`,
+      );
+    }
+    return value;
+  }
+  if (value === null || typeof value === "string") {
     return value;
   }
   throw new Error(
@@ -141,14 +229,63 @@ function toSqlParameter(value: unknown, context: string): SqlParameter {
   );
 }
 
+/**
+ * Whether a field's condition is an operator object rather than a document value
+ * compared for equality. Two tests, and both carry weight: the condition is a
+ * **plain** object, and every key it has names an operator. The second is what
+ * keeps a nested document (`{ city: "x" }`) on the value path where it belongs.
+ *
+ * `{}` counts, with no keys to name (F047). It used to fall through to the value
+ * path and be reported as an unsupported *value* — a message about scalar
+ * comparison, for a caller who supplied no condition at all. `{ ...(bound && {
+ * gte: bound }) }` is the idiomatic optional filter and produces `{}` at exactly
+ * its widest, so the shape is the default state of a filter screen rather than
+ * an exotic one; `compileConditions` gives it the same fail-closed answer as the
+ * sibling spelling `{ gte: undefined }`.
+ *
+ * Which is exactly why the first test has to be about the prototype rather than
+ * about the key count. `{}` is not the only object with no own enumerable keys:
+ * a `Date` is one too, and a `Date` is a *value* this compiler binds against a
+ * stored ISO string (F029). Counting keys used to separate the two by accident;
+ * once an empty condition is meaningful, the separation has to be stated.
+ */
 function isOperatorObject(condition: unknown): condition is FieldOperators<unknown> {
-  if (condition === null || typeof condition !== "object" || Array.isArray(condition)) {
-    return false;
-  }
-  const keys = Object.keys(condition);
-  return keys.length > 0 && keys.every((key) => KNOWN_OPERATORS.has(key as keyof FieldOperators<unknown>));
+  if (condition === null || typeof condition !== "object") return false;
+  const prototype = Object.getPrototypeOf(condition) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  return Object.keys(condition).every((key) => KNOWN_OPERATORS.has(key));
 }
 
+/**
+ * Compile one operator into a boolean expression over `expression`, appending it
+ * to `conditions` and its bound values to `parameters`.
+ *
+ * **The exclusion operators are total over the nullable domain (F042).** A row
+ * whose stored value is SQL `NULL` is excluded from the named *set*, not from
+ * the *answer*. Bare `<> ?` and `NOT IN (…)` evaluate to `NULL` — not true —
+ * against a `NULL` left side, and a `WHERE` keeps only what evaluates to true,
+ * so every null-valued row used to fall silently out of `ne` and `notIn`, and
+ * out of the `deleteMany({ field: { ne: "keep" } })` retention sweep that spells
+ * the same clause on the write path. Both now admit those rows explicitly.
+ *
+ * Two semantics that follow from it, stated here rather than left to be
+ * discovered:
+ *
+ * - **A stored JSON `null` and an absent key stay indistinguishable.**
+ *   `json_extract` returns SQL `NULL` for both, so every operator in this
+ *   function reads them as one and the same "no value" — which is what
+ *   `eq: null` and `isNull` already did.
+ * - **A `null` inside an `in`/`notIn` list names that same "no value" as a
+ *   member of the set**, rather than binding a parameter nothing can equal.
+ *   `in: [null]` therefore means `eq: null` and `notIn: [null]` means
+ *   `ne: null`, and the two operators stay exact complements at every list
+ *   shape.
+ *
+ * Every compound predicate is emitted **already parenthesised**, because the
+ * combinators nest it: a bare `expr IS NULL OR expr <> ?` binds loosely enough
+ * under a sibling `AND`, an `OR` branch or a `NOT` to re-scope the clause it
+ * sits in, which turns a narrowing filter into a widening one.
+ */
 function compileOperator(
   expression: string,
   operator: keyof FieldOperators<unknown>,
@@ -169,7 +306,8 @@ function compileOperator(
       if (operand === null) {
         conditions.push(`${expression} IS NOT NULL`);
       } else {
-        conditions.push(`${expression} <> ?`);
+        // A row with no value is not the named one, so it belongs in the answer.
+        conditions.push(`(${expression} IS NULL OR ${expression} <> ?)`);
         parameters.push(toSqlParameter(operand, `operator "${operator}"`));
       }
       return;
@@ -177,9 +315,10 @@ function compileOperator(
     case "gte":
     case "lt":
     case "lte": {
+      const ordered = readOrderedOperand(operator, operand);
       const sqlOperator = { gt: ">", gte: ">=", lt: "<", lte: "<=" }[operator];
       conditions.push(`${expression} ${sqlOperator} ?`);
-      parameters.push(toSqlParameter(operand, `operator "${operator}"`));
+      parameters.push(toSqlParameter(ordered, `operator "${operator}"`));
       return;
     }
     case "in":
@@ -190,10 +329,37 @@ function compileOperator(
         conditions.push(operator === "in" ? "0" : "1");
         return;
       }
-      const placeholders = values.map(() => "?").join(", ");
+      // A `null` in the list names the rows that have no value — nothing a bound
+      // parameter can equal, so it is carried by an `IS NULL` test instead of a
+      // placeholder, and only the comparable values reach the `IN (…)`.
+      const namesTheAbsence = values.some((value) => value === null);
+      const comparableValues = values.filter((value) => value !== null);
+      if (comparableValues.length === 0) {
+        // The list named nothing but the absence, so that test is the whole
+        // predicate: `in: [null]` is `eq: null`, `notIn: [null]` is `ne: null`.
+        conditions.push(
+          operator === "in" ? `${expression} IS NULL` : `${expression} IS NOT NULL`,
+        );
+        return;
+      }
+      const placeholders = comparableValues.map(() => "?").join(", ");
       const keyword = operator === "in" ? "IN" : "NOT IN";
-      conditions.push(`${expression} ${keyword} (${placeholders})`);
-      for (const value of values) {
+      const membership = `${expression} ${keyword} (${placeholders})`;
+      if (operator === "in") {
+        conditions.push(
+          namesTheAbsence ? `(${expression} IS NULL OR ${membership})` : membership,
+        );
+      } else {
+        // `notIn` drops the null-valued rows only when the list named the
+        // absence; otherwise they are outside the named set and the answer keeps
+        // them, which a bare `NOT IN (…)` never did (F042).
+        conditions.push(
+          namesTheAbsence
+            ? `(${expression} IS NOT NULL AND ${membership})`
+            : `(${expression} IS NULL OR ${membership})`,
+        );
+      }
+      for (const value of comparableValues) {
         parameters.push(toSqlParameter(value, `operator "${operator}"`));
       }
       return;
@@ -218,9 +384,39 @@ function compileOperator(
       return;
     }
     case "isNull":
-      conditions.push(`${expression} ${operand ? "IS NULL" : "IS NOT NULL"}`);
+      conditions.push(
+        `${expression} ${readBooleanOperand(operator, operand) ? "IS NULL" : "IS NOT NULL"}`,
+      );
       return;
+    default:
+      return assertNoUncompiledOperator(operator);
   }
+}
+
+/**
+ * The exhaustiveness backstop for the switch above (F050).
+ *
+ * An operator lives in two places — `FieldOperators` declares it and
+ * `compileOperator` compiles it — and nothing used to check that they agree. The
+ * switch returned `void` with no `default`, so a function allowed to fall off
+ * its end is one TypeScript has no reason to complain about: an operator added
+ * to the interface and forgotten in the switch pushed *no condition*, and a
+ * condition that is simply not in the `WHERE` is the fail-open widening the
+ * `NO_MATCH` machinery exists to close everywhere else. On the delete path the
+ * consequence is total — `deleteMany({ age: { between: [1, 2] } })` would have
+ * emptied the table and reported the count truthfully.
+ *
+ * The `never` parameter is the whole mechanism: a missing case leaves `operator`
+ * narrowed to that case's literal type here, which does not assign to `never`,
+ * so `mise run typecheck` fails. It throws as well as failing to compile,
+ * because `KNOWN_OPERATORS` is a runtime set and a mismatch that arrives through
+ * a path `--noEmit` never saw must not fall through silently either.
+ */
+function assertNoUncompiledOperator(operator: never): never {
+  throw new Error(
+    `Operator "${String(operator)}" has no case in the query compiler, so it would ` +
+      `contribute no condition and silently widen the clause it was written to narrow`,
+  );
 }
 
 /**
@@ -350,7 +546,20 @@ function compileConditions(where: Record<string, unknown>): CompiledConditions {
     const expression = jsonExtract(key);
 
     if (isOperatorObject(condition)) {
-      for (const [operator, operand] of Object.entries(condition)) {
+      const operatorEntries = Object.entries(condition);
+      // An operator object naming no operator is a condition the caller did not
+      // supply — the third spelling of the situation the two `undefined`
+      // branches already answer, and it gets their answer rather than a third
+      // one by accident (F047). `{ age: { ...(bound && { gte: bound }) } }` is
+      // the idiomatic optional filter, and it is this shape precisely when the
+      // filter is at its widest, which is where widening costs the most.
+      if (operatorEntries.length === 0) {
+        conditions.push(NO_MATCH);
+        absent = true;
+        containsAbsent = true;
+        continue;
+      }
+      for (const [operator, operand] of operatorEntries) {
         // The same missing value, one level further in: `{ age: { gte: filter } }`
         // with an unset `filter` must not compile to "every age".
         if (operand === undefined) {

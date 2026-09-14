@@ -13,19 +13,34 @@ export type SqlParameter = string | number | null;
 export interface FieldOperators<TValue> {
   /** Equal. `eq: null` compiles to `IS NULL`. */
   eq?: TValue;
-  /** Not equal. `ne: null` compiles to `IS NOT NULL`. */
+  /**
+   * Not equal. `ne: null` compiles to `IS NOT NULL`; on any other operand the
+   * null-valued rows are kept, because a row with no value is not the named one
+   * (F042).
+   */
   ne?: TValue;
-  /** Greater than. */
+  /**
+   * Greater than. The operand must name a value to order against: `null` is
+   * refused, because a range comparison against no value has no answer — use
+   * `isNull` or `eq: null` to name the rows that have no value (F046).
+   */
   gt?: TValue;
-  /** Greater than or equal. */
+  /** Greater than or equal. `null` is refused, as it is for `gt`. */
   gte?: TValue;
-  /** Less than. */
+  /** Less than. `null` is refused, as it is for `gt`. */
   lt?: TValue;
-  /** Less than or equal. */
+  /** Less than or equal. `null` is refused, as it is for `gt`. */
   lte?: TValue;
-  /** Membership. An empty list matches nothing. */
+  /**
+   * Membership. An empty list matches nothing. A `null` in the list names the
+   * rows that have no value, so `in: [null]` is `eq: null`.
+   */
   in?: readonly TValue[];
-  /** Exclusion. An empty list matches everything. */
+  /**
+   * Exclusion. An empty list matches everything, and the null-valued rows are
+   * kept unless the list names `null` — they are outside the named set, not
+   * outside the answer (F042). `notIn: [null]` is `ne: null`.
+   */
   notIn?: readonly TValue[];
   /**
    * A **raw** SQL `LIKE` pattern (string fields), the expert escape hatch:
@@ -42,13 +57,22 @@ export interface FieldOperators<TValue> {
   startsWith?: string;
   /** Suffix match. The operand is escaped, so `%` and `_` are literal. */
   endsWith?: string;
-  /** `isNull: true` compiles to `IS NULL`, `false` to `IS NOT NULL`. */
+  /**
+   * `isNull: true` compiles to `IS NULL`, `false` to `IS NOT NULL`. The operand
+   * must be an actual boolean: anything else is refused rather than read for
+   * truthiness, so `isNull: "false"` — what an HTTP query string yields before
+   * anything parses it — cannot select the rows it was written to exclude
+   * (F046).
+   */
   isNull?: boolean;
 }
 
 /**
  * A single field's condition: either a bare value (shorthand for `{ eq: value }`)
- * or an operator object.
+ * or an operator object. An operator object naming no operator — `{}`, which is
+ * what the idiomatic optional-filter spread produces when the bound is unset —
+ * is a condition that was not supplied, and narrows to no match rather than
+ * widening (F047).
  */
 export type FieldCondition<TValue> = TValue | FieldOperators<TValue>;
 

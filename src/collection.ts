@@ -5,6 +5,7 @@ import {
   compileOrderBy,
   compileWhere,
   jsonExtract,
+  RESERVED_WHERE_KEYS,
 } from "./query.ts";
 import { isReference } from "./ref.ts";
 import type {
@@ -176,6 +177,13 @@ function assertIdentifier(value: string, role: string): void {
  * the collision is refused where the schema is declared rather than left to
  * surface as a silently mis-compiled filter.
  *
+ * The names come from `src/query.ts`, which owns the where-grammar and is the
+ * only file entitled to say what a reserved key is; this file used to keep a
+ * second literal list of its own, so the guarantee above held only for as long
+ * as somebody remembered to edit both (F051). The message renders from the same
+ * set for the same reason — prose that names the keys drifts where the list no
+ * longer can.
+ *
  * Reaches as far as the schema's shape is readable, which is a plain object
  * schema and the wrappers that keep a `.shape` (`.refine()`, `.brand()`). A
  * schema with no readable shape — `.transform()`, `.pipe()`, a union — is not
@@ -183,8 +191,6 @@ function assertIdentifier(value: string, role: string): void {
  * below, and closing it is one change to how this file reads a schema rather
  * than two guards patched separately — F020.
  */
-const RESERVED_FIELD_NAMES = new Set(["OR", "NOT"]);
-
 function assertNoReservedFieldNames(
   schema: z.ZodType,
   collectionName: string,
@@ -194,11 +200,12 @@ function assertNoReservedFieldNames(
   const fieldNames =
     typeof shape === "object" && shape !== null ? Object.keys(shape) : [];
   for (const fieldName of [...fieldNames, idField]) {
-    if (!RESERVED_FIELD_NAMES.has(fieldName)) continue;
+    if (!RESERVED_WHERE_KEYS.has(fieldName)) continue;
+    const reservedList = [...RESERVED_WHERE_KEYS].map((key) => `"${key}"`).join(", ");
     throw new Error(
       `Collection "${collectionName}": field "${fieldName}" is a reserved ` +
-        `where-clause key. "OR" and "NOT" combine clauses, so a field of that ` +
-        `name could never be filtered on; rename it.`,
+        `where-clause key. The reserved keys (${reservedList}) combine clauses, ` +
+        `so a field of that name could never be filtered on; rename it.`,
     );
   }
 }

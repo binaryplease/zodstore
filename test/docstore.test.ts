@@ -8,6 +8,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,16 +17,24 @@ import { z } from "zod";
 // the library against both ends of `"zod": "^3.24.0 || ^4.3"` (F028).
 import { z as zodThree } from "zod3";
 import {
+  type CompiledClause,
   compileWhere,
   createCollection,
   createStore,
   dateParser,
   DEFAULT_MAX_ROWS,
   type DocStore,
+  type FieldOperators,
   populate,
   ref,
   transactionAcross,
 } from "../src/index.ts";
+// Not part of the published surface — `src/index.ts` deliberately does not
+// re-export it, because it describes the where-grammar rather than the library
+// (F051). The suite reads it from the module that owns it, which is the point:
+// a test that hardcoded the same two strings would be the third copy of the
+// list this change exists to collapse.
+import { RESERVED_WHERE_KEYS } from "../src/query.ts";
 
 function inTemporaryDirectory<TResult>(work: (directory: string) => TResult): TResult {
   const directory = mkdtempSync(join(tmpdir(), "docstore-"));
@@ -254,6 +263,350 @@ describe("find — typed where-clause", () => {
     expect(users.findOne({ where: { active: false } })?.id).toBe("user_2");
     expect(users.findOne({ where: { name: "nobody" } })).toBeNull();
     expect(users.count({ active: true })).toBe(2);
+  });
+});
+
+// F042 — `ne` compiled to a bare `<> ?` and `notIn` to a bare `NOT IN (…)`, and
+// in SQL both evaluate to NULL rather than true against a NULL left side. A
+// WHERE keeps only what evaluates to true, so every row with no value fell
+// silently out of the exclusion half of the operator table — and survived the
+// `deleteMany({ field: { ne: "keep" } })` retention sweep that spells it on the
+// write path.
+describe("ne and notIn keep the null-valued rows (F042)", () => {
+  function seeded() {
+    const { users } = freshUsers();
+    users.insertMany([
+      { id: "user_mine", age: 20, active: true, nickname: "mine" },
+      { id: "user_yours", age: 30, active: false, nickname: "yours" },
+      // The schema the mandatory-defaults rule pushes a caller toward:
+      // `z.string().nullable().default(null)`, so this row stores a JSON null.
+      { id: "user_unset", age: 40, active: true, nickname: null },
+    ]);
+    return users;
+  }
+
+  test("ne returns the row with no value, through find, findOne and count", () => {
+    const users = seeded();
+    expect(users.find({ where: { nickname: { ne: "mine" } } }).map((user) => user.id)).toEqual([
+      "user_yours",
+      "user_unset",
+    ]);
+    expect(
+      users.findOne({ where: { nickname: { ne: "mine" } }, orderBy: { field: "age", direction: "desc" } })?.id,
+    ).toBe("user_unset");
+    expect(users.count({ nickname: { ne: "mine" } })).toBe(2);
+  });
+
+  test("notIn returns the row with no value, through find, findOne and count", () => {
+    const users = seeded();
+    expect(
+      users.find({ where: { nickname: { notIn: ["mine"] } } }).map((user) => user.id),
+    ).toEqual(["user_yours", "user_unset"]);
+    expect(
+      users.find({ where: { nickname: { notIn: ["mine", "yours"] } } }).map((user) => user.id),
+    ).toEqual(["user_unset"]);
+    expect(users.findOne({ where: { nickname: { notIn: ["mine", "yours"] } } })?.id).toBe(
+      "user_unset",
+    );
+    expect(users.count({ nickname: { notIn: ["mine", "yours"] } })).toBe(1);
+  });
+
+  test("the same clause under deleteMany removes the named rows only", () => {
+    // Asserted by surviving ids, not by the returned count: the count is what
+    // the broken filter also reported truthfully about its own narrower answer.
+    const byNe = seeded();
+    byNe.deleteMany({ nickname: { ne: "mine" } });
+    expect(byNe.find().map((user) => user.id)).toEqual(["user_mine"]);
+
+    const byNotIn = seeded();
+    byNotIn.deleteMany({ nickname: { notIn: ["mine"] } });
+    expect(byNotIn.find().map((user) => user.id)).toEqual(["user_mine"]);
+  });
+
+  test("eq: null, ne: null and isNull keep their current meanings", () => {
+    const users = seeded();
+    expect(users.find({ where: { nickname: null } }).map((user) => user.id)).toEqual([
+      "user_unset",
+    ]);
+    expect(users.find({ where: { nickname: { eq: null } } }).map((user) => user.id)).toEqual([
+      "user_unset",
+    ]);
+    expect(users.find({ where: { nickname: { ne: null } } }).map((user) => user.id)).toEqual([
+      "user_mine",
+      "user_yours",
+    ]);
+    expect(users.find({ where: { nickname: { isNull: true } } }).map((user) => user.id)).toEqual([
+      "user_unset",
+    ]);
+  });
+
+  test("a null in an in / notIn list names the rows that have no value", () => {
+    const users = seeded();
+    // The singleton spellings and the list spellings answer the same question.
+    expect(users.find({ where: { nickname: { in: [null] } } }).map((user) => user.id)).toEqual([
+      "user_unset",
+    ]);
+    expect(users.find({ where: { nickname: { notIn: [null] } } }).map((user) => user.id)).toEqual([
+      "user_mine",
+      "user_yours",
+    ]);
+    expect(
+      users.find({ where: { nickname: { in: ["mine", null] } } }).map((user) => user.id),
+    ).toEqual(["user_mine", "user_unset"]);
+    // Neither "mine" nor unset — and the exact complement of the line above.
+    expect(
+      users.find({ where: { nickname: { notIn: ["mine", null] } } }).map((user) => user.id),
+    ).toEqual(["user_yours"]);
+  });
+
+  test("the rewritten predicate is parenthesised, so nesting cannot re-scope it", () => {
+    const users = seeded();
+    // A sibling AND is where a missing paren shows: unparenthesised this reads
+    // `(active AND nickname IS NULL) OR nickname <> ?`, which returns the
+    // inactive "yours" row the `active: true` sibling exists to exclude.
+    expect(
+      users.find({ where: { active: true, nickname: { ne: "mine" } } }).map((user) => user.id),
+    ).toEqual(["user_unset"]);
+    expect(
+      users
+        .find({ where: { OR: [{ nickname: { ne: "mine" } }, { age: 20 }] } })
+        .map((user) => user.id),
+    ).toEqual(["user_mine", "user_yours", "user_unset"]);
+    // NOT of the rewritten predicate is the named set itself — the null-valued
+    // row is inside the negation, not stranded outside both halves.
+    expect(
+      users.find({ where: { NOT: { nickname: { ne: "mine" } } } }).map((user) => user.id),
+    ).toEqual(["user_mine"]);
+    expect(
+      users
+        .find({ where: { NOT: { active: true, nickname: { ne: "mine" } } } })
+        .map((user) => user.id),
+    ).toEqual(["user_mine", "user_yours"]);
+    expect(
+      users
+        .find({ where: { NOT: { nickname: { notIn: ["mine", "yours"] } } } })
+        .map((user) => user.id),
+    ).toEqual(["user_mine", "user_yours"]);
+  });
+
+  test("an absent key answers as a stored null does, because json_extract cannot tell them apart", () => {
+    // A field added by an extended schema is absent from every row written
+    // before it existed, and `json_extract` returns SQL NULL for an absent key
+    // exactly as it does for a stored JSON null — so the documented semantic is
+    // that the two are one and the same to a where-clause.
+    //
+    // Whether the *default* the extended schema declares should show through to
+    // a SQL-side filter instead is the open question of #4 (F041), which is
+    // independent of this one and deliberately not decided here.
+    const store = createStore();
+    const oldPeople = store.collection(
+      "people",
+      z.object({ id: ref("user"), name: z.string().default("") }),
+    );
+    oldPeople.insert({ id: "user_legacy", name: "Legacy" });
+
+    const newPeople = store.collection(
+      "people",
+      z.object({
+        id: ref("user"),
+        name: z.string().default(""),
+        nickname: z.string().nullable().default(null),
+      }),
+    );
+    newPeople.insert({ id: "user_fresh", name: "Fresh", nickname: "mine" });
+
+    expect(
+      newPeople.find({ where: { nickname: { ne: "mine" } } }).map((person) => person.id),
+    ).toEqual(["user_legacy"]);
+    expect(
+      newPeople.find({ where: { nickname: { notIn: ["mine"] } } }).map((person) => person.id),
+    ).toEqual(["user_legacy"]);
+    expect(
+      newPeople.find({ where: { nickname: null } }).map((person) => person.id),
+    ).toEqual(["user_legacy"]);
+  });
+});
+
+// F046 — three operand paths through the compiler answered a nonsense operand
+// with a filter instead of refusing it, in a file that names a bad operand
+// everywhere else. Each returned an empty or inverted result set that no caller
+// could tell apart from a truthful one, so the bug was attributed to the data.
+//
+// The operands are not exotic: `NaN` is what `Number(badQueryParam)` produces,
+// and `"false"` is what a query string yields for `?isNull=false` before
+// anything parses it — both arrive from the ordinary path of forwarding parsed
+// HTTP input into a filter, which is the use the typed surface is for.
+//
+// The `as` casts below are the point rather than a convenience: the typed
+// surface already forbids these operands, so each one stands for a value that
+// reached the compiler from outside TypeScript's reach.
+describe("a nonsense operand is refused, never answered emptily (F046)", () => {
+  function seeded() {
+    const { users } = freshUsers();
+    users.insertMany([
+      { id: "user_mine", age: 30, nickname: "mine" },
+      { id: "user_unset", age: 40, nickname: null },
+    ]);
+    return users;
+  }
+
+  test("NaN is refused, naming the field or the operator it arrived at", () => {
+    const users = seeded();
+    // It bound as SQL NULL, and every comparison against NULL is unknown.
+    expect(() => users.find({ where: { age: Number.NaN } })).toThrow(
+      /Invalid number operand for field "age": NaN denotes no value to compare against/,
+    );
+    expect(() => users.find({ where: { age: { gt: Number.NaN } } })).toThrow(
+      /Invalid number operand for operator "gt": NaN denotes no value to compare against/,
+    );
+    // Wherever an operand travels to `toSqlParameter`, including inside a list.
+    expect(() => users.find({ where: { age: { in: [30, Number.NaN] } } })).toThrow(
+      /Invalid number operand for operator "in"/,
+    );
+    expect(() => users.count({ age: Number.NaN })).toThrow(/NaN denotes no value/);
+    expect(() => users.deleteMany({ age: Number.NaN })).toThrow(/NaN denotes no value/);
+    expect(users.count()).toBe(2);
+  });
+
+  test("Infinity passes, because it orders and therefore answers", () => {
+    // Decided rather than inherited (F046). `bun:sqlite` binds a non-finite
+    // number as REAL — not as the NULL it binds NaN as — so these are working
+    // filters over the stored numbers, and refusing them would remove a query
+    // that answers correctly rather than a way to spell a mistake.
+    const users = seeded();
+    expect(
+      users.find({ where: { age: { lt: Number.POSITIVE_INFINITY } } }).map((user) => user.id),
+    ).toEqual(["user_mine", "user_unset"]);
+    expect(
+      users.find({ where: { age: { gt: Number.NEGATIVE_INFINITY } } }).map((user) => user.id),
+    ).toEqual(["user_mine", "user_unset"]);
+    expect(users.find({ where: { age: { gt: Number.POSITIVE_INFINITY } } })).toEqual([]);
+  });
+
+  test("isNull requires the boolean it declares, rather than reading truthiness", () => {
+    const users = seeded();
+    // The sharpest of the three: this returned exactly the rows the boolean
+    // spelling was asked to exclude, and on deleteMany it deleted them.
+    expect(() =>
+      users.find({ where: { nickname: { isNull: "false" as unknown as boolean } } }),
+    ).toThrow(/Operator "isNull" expects a boolean operand, got string/);
+    expect(() =>
+      users.deleteMany({ nickname: { isNull: "false" as unknown as boolean } }),
+    ).toThrow(/Operator "isNull" expects a boolean operand, got string/);
+    expect(users.count()).toBe(2);
+    expect(() =>
+      users.find({ where: { nickname: { isNull: 1 as unknown as boolean } } }),
+    ).toThrow(/Operator "isNull" expects a boolean operand, got number/);
+    expect(() =>
+      users.find({ where: { nickname: { isNull: null as unknown as boolean } } }),
+    ).toThrow(/Operator "isNull" expects a boolean operand, got null/);
+
+    // Both boolean spellings still answer exactly what they answered before.
+    expect(
+      users.find({ where: { nickname: { isNull: false } } }).map((user) => user.id),
+    ).toEqual(["user_mine"]);
+    expect(
+      users.find({ where: { nickname: { isNull: true } } }).map((user) => user.id),
+    ).toEqual(["user_unset"]);
+  });
+
+  test("a range operator refuses null, and names the spelling that was meant", () => {
+    const users = seeded();
+    for (const operator of ["gt", "gte", "lt", "lte"] as const) {
+      expect(() =>
+        users.find({ where: { age: { [operator]: null as unknown as number } } }),
+      ).toThrow(
+        new RegExp(`Operator "${operator}" expects a value to order against, got null`),
+      );
+    }
+    expect(() => users.find({ where: { age: { gt: null as unknown as number } } })).toThrow(
+      /use "isNull" or "eq: null" to name the rows that have no value/,
+    );
+    // The spellings the message points at are untouched, as is an ordinary bound.
+    expect(users.find({ where: { nickname: { eq: null } } }).map((user) => user.id)).toEqual([
+      "user_unset",
+    ]);
+    expect(users.find({ where: { age: { gt: 30 } } }).map((user) => user.id)).toEqual([
+      "user_unset",
+    ]);
+  });
+
+  test("a Date operand still travels the tightened path unchanged (F029)", () => {
+    // `toSqlParameter` is shared, so tightening the number branch had to leave
+    // the Date branch — and its own refusals — exactly where they were.
+    const store = createStore();
+    const events = store.collection(
+      "events",
+      z.object({ id: ref("evt"), at: dateParser.default(() => new Date(0)) }),
+    );
+    events.insert({ id: "evt_1", at: new Date("2026-06-01T12:00:00.000Z") });
+    expect(
+      events.find({ where: { at: { gt: new Date("2026-01-01T00:00:00.000Z") } } }).map(
+        (event) => event.id,
+      ),
+    ).toEqual(["evt_1"]);
+    expect(() => events.find({ where: { at: new Date("nonsense") } })).toThrow(
+      /Invalid Date operand for field "at"/,
+    );
+  });
+});
+
+// F047 — `{}` fell through the operator-object test and was reported as an
+// unsupported *value*, with a message about scalar comparison, to a caller who
+// had supplied no condition at all. It is the third spelling of a situation the
+// compiler already had an answer for, and it now gets that answer: absent
+// narrows, it never widens (F022).
+describe("an operator object naming no operator is an absent condition (F047)", () => {
+  function seeded() {
+    const { users } = freshUsers();
+    users.insertMany([
+      { id: "user_young", age: 20 },
+      { id: "user_old", age: 40 },
+    ]);
+    return users;
+  }
+
+  test("the conditional-spread shape narrows rather than throwing", () => {
+    // The idiomatic optional filter, at exactly the width where it is `{}`.
+    const minimumAge: number | undefined = undefined;
+    const users = seeded();
+    const where = { age: { ...(minimumAge !== undefined && { gte: minimumAge }) } };
+    expect(users.find({ where })).toEqual([]);
+    expect(users.count(where)).toBe(0);
+    // Through deleteMany the fail-open reading would have emptied the table,
+    // and the throw it used to be would have crashed the widest filter view.
+    expect(users.deleteMany(where)).toBe(0);
+    expect(users.count()).toBe(2);
+    // With the bound supplied, the same expression is a live filter.
+    const suppliedAge: number | undefined = 30;
+    expect(
+      users
+        .find({ where: { age: { ...(suppliedAge !== undefined && { gte: suppliedAge }) } } })
+        .map((user) => user.id),
+    ).toEqual(["user_old"]);
+  });
+
+  test("the absence carries its polarity through OR and NOT", () => {
+    const users = seeded();
+    // One live alternative is still a filter the caller can stand behind.
+    expect(
+      users.find({ where: { OR: [{ age: {} }, { age: 20 }] } }).map((user) => user.id),
+    ).toEqual(["user_young"]);
+    // ...but negating that disjunction would widen it by exactly the rows the
+    // missing condition existed to exclude, so the gap survives the negation.
+    expect(users.find({ where: { NOT: { OR: [{ age: {} }, { age: 20 }] } } })).toEqual([]);
+    expect(users.find({ where: { NOT: { age: {} } } })).toEqual([]);
+    expect(users.deleteMany({ NOT: { age: {} } })).toBe(0);
+    expect(users.count()).toBe(2);
+  });
+
+  test("a plain object supplied as a field value still names the value as the fault", () => {
+    // The case the key test exists to catch: a nested document is not a
+    // condition, and the scalar-comparison message is the right one for it.
+    const users = seeded();
+    expect(() =>
+      users.find({ where: { age: { city: "x" } as unknown as number } }),
+    ).toThrow(/Unsupported filter value of type object: where-clauses compare scalar fields only/);
   });
 });
 
@@ -492,6 +845,42 @@ describe("OR / NOT combinators (F012)", () => {
     expect(() =>
       store.collection("bad", z.object({ id: ref("b"), NOT: z.string().default("") })),
     ).toThrow(/field "NOT" is a reserved where-clause key/);
+  });
+
+  // F051 — the reserved names were written out twice, in the two files that have
+  // to agree about them, with no import and no type relating the lists. The
+  // guard above was correct only for as long as somebody remembered to edit
+  // both, and its failure is silent: a field that shadows a combinator is
+  // matched as a combinator before it can reach `jsonExtract`, so the filter
+  // answers with rows that do not match.
+  //
+  // So this asserts the coupling rather than the contents. It is derived from
+  // the exported set, which means a combinator added to the grammar and not to
+  // the guard fails here instead of shipping.
+  test("every key the compiler treats as a combinator is refused as a field name (F051)", () => {
+    expect(RESERVED_WHERE_KEYS.size).toBeGreaterThan(0);
+    for (const reservedKey of RESERVED_WHERE_KEYS) {
+      const store = createStore();
+      expect(() =>
+        store.collection(
+          "bad",
+          z.object({ id: ref("b"), [reservedKey]: z.string().default("") }),
+        ),
+      ).toThrow(new RegExp(`field "${reservedKey}" is a reserved where-clause key`));
+      // Including as the id field, which is named separately from the shape.
+      expect(() =>
+        store.collection("bad", z.object({ [reservedKey]: ref("b") }), {
+          idField: reservedKey,
+        }),
+      ).toThrow(new RegExp(`field "${reservedKey}" is a reserved where-clause key`));
+      // The message renders from the same set, so it cannot drift from it.
+      expect(() =>
+        store.collection(
+          "bad",
+          z.object({ id: ref("b"), [reservedKey]: z.string().default("") }),
+        ),
+      ).toThrow(new RegExp(`The reserved keys \\(.*"${reservedKey}".*\\) combine clauses`));
+    }
   });
 });
 
@@ -1525,6 +1914,273 @@ describe("compileWhere — unit", () => {
       parameters: [1, 2],
     });
     expect(compileWhere({ age: { notIn: [] } })).toEqual({ sql: "WHERE 1", parameters: [] });
+  });
+
+  test("ne and notIn name the null case, parenthesised (F042)", () => {
+    const nickname = "json_extract(doc, '$.nickname')";
+    expect(compileWhere({ nickname: { ne: "mine" } })).toEqual({
+      sql: `WHERE (${nickname} IS NULL OR ${nickname} <> ?)`,
+      parameters: ["mine"],
+    });
+    expect(compileWhere({ nickname: { notIn: ["mine", "yours"] } })).toEqual({
+      sql: `WHERE (${nickname} IS NULL OR ${nickname} NOT IN (?, ?))`,
+      parameters: ["mine", "yours"],
+    });
+    // The parentheses are load-bearing, because every combinator nests this
+    // predicate: `AND` binds tighter than `OR`, so an unparenthesised compound
+    // re-scopes the clause around it and turns narrowing into widening.
+    expect(compileWhere({ active: true, nickname: { ne: "mine" } })).toEqual({
+      sql: `WHERE json_extract(doc, '$.active') = ? AND (${nickname} IS NULL OR ${nickname} <> ?)`,
+      parameters: [1, "mine"],
+    });
+    expect(compileWhere({ OR: [{ nickname: { ne: "mine" } }, { age: 20 }] })).toEqual({
+      sql: `WHERE ((${nickname} IS NULL OR ${nickname} <> ?) OR json_extract(doc, '$.age') = ?)`,
+      parameters: ["mine", 20],
+    });
+    expect(compileWhere({ NOT: { nickname: { ne: "mine" } } })).toEqual({
+      sql: `WHERE NOT ((${nickname} IS NULL OR ${nickname} <> ?))`,
+      parameters: ["mine"],
+    });
+    // The null operand is untouched: `ne: null` is still the plain IS NOT NULL.
+    expect(compileWhere({ nickname: { ne: null } })).toEqual({
+      sql: `WHERE ${nickname} IS NOT NULL`,
+      parameters: [],
+    });
+  });
+
+  test("a null in an in / notIn list names the absence, not a parameter (F042)", () => {
+    const nickname = "json_extract(doc, '$.nickname')";
+    // A list naming nothing but the absence is the singleton spelling of it.
+    expect(compileWhere({ nickname: { in: [null] } })).toEqual({
+      sql: `WHERE ${nickname} IS NULL`,
+      parameters: [],
+    });
+    expect(compileWhere({ nickname: { notIn: [null] } })).toEqual({
+      sql: `WHERE ${nickname} IS NOT NULL`,
+      parameters: [],
+    });
+    // A mixed list binds only the comparable values; the null is carried by the
+    // IS NULL test, because no row equals a bound NULL.
+    expect(compileWhere({ nickname: { in: ["mine", null] } })).toEqual({
+      sql: `WHERE (${nickname} IS NULL OR ${nickname} IN (?))`,
+      parameters: ["mine"],
+    });
+    expect(compileWhere({ nickname: { notIn: ["mine", null] } })).toEqual({
+      sql: `WHERE (${nickname} IS NOT NULL AND ${nickname} NOT IN (?))`,
+      parameters: ["mine"],
+    });
+    // The empty list still decides without comparing: no rows, every row.
+    expect(compileWhere({ nickname: { in: [] } })).toEqual({ sql: "WHERE 0", parameters: [] });
+    expect(compileWhere({ nickname: { notIn: [] } })).toEqual({ sql: "WHERE 1", parameters: [] });
+  });
+
+  test("a nonsense operand names the operator or field at fault (F046)", () => {
+    expect(() => compileWhere({ age: Number.NaN })).toThrow(
+      /Invalid number operand for field "age"/,
+    );
+    expect(() => compileWhere({ age: { gt: Number.NaN } })).toThrow(
+      /Invalid number operand for operator "gt"/,
+    );
+    expect(() => compileWhere({ nickname: { isNull: "false" } })).toThrow(
+      /Operator "isNull" expects a boolean operand, got string/,
+    );
+    expect(() => compileWhere({ age: { lte: null } })).toThrow(
+      /Operator "lte" expects a value to order against, got null/,
+    );
+    // Everything the tightened paths still accept, compiling to what it always
+    // did — the fix is a refusal of bad input, not a change in filter semantics.
+    const age = "json_extract(doc, '$.age')";
+    const nickname = "json_extract(doc, '$.nickname')";
+    expect(compileWhere({ age: { gt: 30 } })).toEqual({
+      sql: `WHERE ${age} > ?`,
+      parameters: [30],
+    });
+    expect(compileWhere({ age: { lt: Number.POSITIVE_INFINITY } })).toEqual({
+      sql: `WHERE ${age} < ?`,
+      parameters: [Number.POSITIVE_INFINITY],
+    });
+    expect(compileWhere({ nickname: { isNull: true } })).toEqual({
+      sql: `WHERE ${nickname} IS NULL`,
+      parameters: [],
+    });
+    expect(compileWhere({ nickname: { isNull: false } })).toEqual({
+      sql: `WHERE ${nickname} IS NOT NULL`,
+      parameters: [],
+    });
+    expect(compileWhere({ nickname: { eq: null } })).toEqual({
+      sql: `WHERE ${nickname} IS NULL`,
+      parameters: [],
+    });
+    expect(compileWhere({ nickname: { ne: null } })).toEqual({
+      sql: `WHERE ${nickname} IS NOT NULL`,
+      parameters: [],
+    });
+  });
+
+  test("an operator object naming no operator compiles to a no-match (F047)", () => {
+    // The same answer as the sibling spelling below it, which is the whole
+    // point: two ways of writing "this bound may not be supplied" that used to
+    // diverge — one a fail-closed 0, the other a throw about scalar values.
+    expect(compileWhere({ age: {} })).toEqual({ sql: "WHERE 0", parameters: [] });
+    expect(compileWhere({ age: { gte: undefined } })).toEqual({ sql: "WHERE 0", parameters: [] });
+    // It carries the polarity rules of every other absent condition (F022).
+    expect(compileWhere({ OR: [{ age: {} }, { name: "a" }] })).toEqual({
+      sql: "WHERE (0 OR json_extract(doc, '$.name') = ?)",
+      parameters: ["a"],
+    });
+    expect(compileWhere({ NOT: { age: {} } })).toEqual({ sql: "WHERE 0", parameters: [] });
+    expect(compileWhere({ NOT: { OR: [{ age: {} }, { name: "a" }] } })).toEqual({
+      sql: "WHERE 0",
+      parameters: [],
+    });
+    // A `where` of `{}` is still the caller asking for no filter at all — the
+    // one documented route to an unfiltered statement, one level up from this.
+    expect(compileWhere({})).toEqual({ sql: "", parameters: [] });
+    // And the distinction the key test exists for survives: an object whose keys
+    // are not operators is a value, and a Date is a value with no keys at all.
+    expect(() => compileWhere({ address: { city: "x" } })).toThrow(
+      /Unsupported filter value of type object/,
+    );
+    expect(compileWhere({ at: new Date("2026-06-01T12:00:00.000Z") })).toEqual({
+      sql: "WHERE json_extract(doc, '$.at') = ?",
+      parameters: ["2026-06-01T12:00:00.000Z"],
+    });
+  });
+
+  test("every operator in the grammar compiles to the SQL it compiled to before (F050)", () => {
+    // The property the exhaustiveness backstop must not disturb: it is added so
+    // that a *missing* case cannot compile, and no present case changes shape.
+    // Operator by operator, because a table is the only way to say "every one".
+    const field = "json_extract(doc, '$.field')";
+    const compiledForms: Array<[keyof FieldOperators<unknown>, CompiledClause]> = [
+      ["eq", { sql: `WHERE ${field} = ?`, parameters: ["x"] }],
+      ["ne", { sql: `WHERE (${field} IS NULL OR ${field} <> ?)`, parameters: ["x"] }],
+      ["gt", { sql: `WHERE ${field} > ?`, parameters: ["x"] }],
+      ["gte", { sql: `WHERE ${field} >= ?`, parameters: ["x"] }],
+      ["lt", { sql: `WHERE ${field} < ?`, parameters: ["x"] }],
+      ["lte", { sql: `WHERE ${field} <= ?`, parameters: ["x"] }],
+      ["in", { sql: `WHERE ${field} IN (?)`, parameters: ["x"] }],
+      ["notIn", { sql: `WHERE (${field} IS NULL OR ${field} NOT IN (?))`, parameters: ["x"] }],
+      ["like", { sql: `WHERE ${field} LIKE ? ESCAPE '\\'`, parameters: ["x"] }],
+      ["contains", { sql: `WHERE ${field} LIKE ? ESCAPE '\\'`, parameters: ["%x%"] }],
+      ["startsWith", { sql: `WHERE ${field} LIKE ? ESCAPE '\\'`, parameters: ["x%"] }],
+      ["endsWith", { sql: `WHERE ${field} LIKE ? ESCAPE '\\'`, parameters: ["%x"] }],
+      ["isNull", { sql: `WHERE ${field} IS NULL`, parameters: [] }],
+    ];
+    // The list operators take a list and `isNull` takes a boolean; everything
+    // else takes the bare operand.
+    const operandFor = (operator: keyof FieldOperators<unknown>): unknown =>
+      operator === "in" || operator === "notIn" ? ["x"] : operator === "isNull" ? true : "x";
+
+    for (const [operator, expected] of compiledForms) {
+      expect(compileWhere({ field: { [operator]: operandFor(operator) } })).toEqual(expected);
+    }
+    // The table is the whole grammar, not a subset of it: an operator added to
+    // `FieldOperators` and not to this list leaves the assertion below failing,
+    // which is the suite's half of the coupling the compiler now enforces.
+    expect(compiledForms.map(([operator]) => operator).sort()).toEqual(
+      (Object.keys({
+        eq: true,
+        ne: true,
+        gt: true,
+        gte: true,
+        lt: true,
+        lte: true,
+        in: true,
+        notIn: true,
+        like: true,
+        contains: true,
+        startsWith: true,
+        endsWith: true,
+        isNull: true,
+      } satisfies Record<keyof FieldOperators<unknown>, true>) as Array<
+        keyof FieldOperators<unknown>
+      >).sort(),
+    );
+  });
+});
+
+// F050 — an operator lives in `FieldOperators` and in the switch that compiles
+// it, and nothing checked that they agree. The switch returned void with no
+// default, so TypeScript had no reason to object to a missing case: the operator
+// pushed no condition, the condition was simply not in the WHERE, and a clause
+// that loses its only condition is an unfiltered DELETE FROM.
+//
+// The property is "a missing case cannot compile", which no ordinary test can
+// observe — an operator that does not exist cannot be called. So it is asserted
+// by making the mistake on a copy of the tree and reading what `tsc` says about
+// it, the way the suite verifies its other guards by breaking them on purpose.
+describe("an operator with no case fails the type-checker (F050)", () => {
+  const repositoryRoot = join(import.meta.dir, "..");
+
+  // A copy of `src/` outside the repository, with `node_modules` symlinked in so
+  // `zod` and the Bun types resolve exactly as they do in place, and the real
+  // `tsconfig.json` read rather than restated so the check cannot drift from the
+  // gate's own settings.
+  function typecheckCopyOfSource(
+    mutate: (sources: Map<string, string>) => void,
+  ): { exitCode: number; output: string } {
+    return inTemporaryDirectory((directory) => {
+      const sources = new Map(
+        readdirSync(join(repositoryRoot, "src"))
+          .filter((entry) => entry.endsWith(".ts"))
+          .map((entry) => [entry, readFileSync(join(repositoryRoot, "src", entry), "utf8")]),
+      );
+      mutate(sources);
+      for (const [name, contents] of sources) writeFileSync(join(directory, name), contents);
+
+      const tsconfig = JSON.parse(
+        readFileSync(join(repositoryRoot, "tsconfig.json"), "utf8"),
+      ) as { include?: string[]; exclude?: string[] };
+      tsconfig.include = ["*.ts"];
+      delete tsconfig.exclude;
+      writeFileSync(join(directory, "tsconfig.json"), JSON.stringify(tsconfig));
+      symlinkSync(join(repositoryRoot, "node_modules"), join(directory, "node_modules"));
+
+      // The installed compiler, by path rather than through `bunx`: the gate
+      // installs before it runs the suite, and a test that could reach the
+      // network to resolve its own tool is a test that fails for a reason that
+      // has nothing to do with the tree.
+      const checked = Bun.spawnSync({
+        cmd: [
+          join(repositoryRoot, "node_modules", ".bin", "tsc"),
+          "--project",
+          join(directory, "tsconfig.json"),
+        ],
+        cwd: directory,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      return {
+        exitCode: checked.exitCode ?? 1,
+        output: `${checked.stdout.toString()}${checked.stderr.toString()}`,
+      };
+    });
+  }
+
+  // Adding an operator to the interface and to nothing else — which is what
+  // forgetting the switch looks like as a diff.
+  const declareUncompiledOperator = (sources: Map<string, string>): void => {
+    const types = sources.get("types.ts") ?? "";
+    sources.set(
+      "types.ts",
+      types.replace("  isNull?: boolean;", "  isNull?: boolean;\n  between?: readonly TValue[];"),
+    );
+  };
+
+  test("the unmutated copy type-checks, so the mutation is what fails it", () => {
+    const checked = typecheckCopyOfSource(() => {});
+    expect(checked.output).toBe("");
+    expect(checked.exitCode).toBe(0);
+  });
+
+  test("an operator declared with no case to compile it is a type error", () => {
+    const checked = typecheckCopyOfSource(declareUncompiledOperator);
+    expect(checked.exitCode).not.toBe(0);
+    // Named at the backstop, in the file that owns the grammar — and it is the
+    // *switch* that fails, so the message points at the case nobody wrote.
+    expect(checked.output).toContain("query.ts");
+    expect(checked.output).toMatch(/not assignable to parameter of type 'never'/);
   });
 });
 
