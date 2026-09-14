@@ -877,6 +877,44 @@ describe("OR / NOT combinators (F012)", () => {
     }
   });
 
+  // What a write *stores* is the schema's output, so a reserved name that only
+  // appears on a pipe's far side is the same collision. The declared-default
+  // rule still reads the input side — that is what an already-stored row is
+  // parsed against — but this guard is about names, and it reads both.
+  test("a reserved name on a pipe's output side is refused too", () => {
+    const store = createStore();
+    const piped = z
+      .object({ id: ref("b"), value: z.string().default("") })
+      .pipe(z.object({ id: z.string(), value: z.string(), NOT: z.string().default("x") }));
+    expect(() => store.collection("bad", piped as unknown as z.ZodType)).toThrow(
+      /field "NOT" is a reserved where-clause key/,
+    );
+  });
+
+  // The limit that is left, pinned so it stays a known one. A `.transform()`
+  // declares its output in a function body, and no reader can say what a
+  // function returns without running it — so a transform that *adds* a reserved
+  // name is accepted, and the field it stores is unreachable by a where-clause.
+  // The guard is a strong default, not a proof; the README, `Where`'s JSDoc and
+  // the guard's own JSDoc all say so, and say not to name a field OR or NOT.
+  test("a transform that adds a reserved field is the guard's known limit", () => {
+    const store = createStore();
+    const added = z
+      .object({ id: ref("d"), value: z.string().default("") })
+      .loose()
+      .transform((document) => ({ ...document, NOT: "flagged" }));
+    // Accepted: the output shape is a function body, not a declaration.
+    const rows = store.collection("docs", added as unknown as z.ZodType) as unknown as {
+      insert(input: { id: string; value: string }): unknown;
+      find(options: { where: Record<string, unknown> }): unknown[];
+    };
+    rows.insert({ id: "d_1", value: "v" });
+    // And the stored field is addressed as the combinator, never as a field —
+    // which is exactly why the disclosure has to stay honest.
+    expect(rows.find({ where: { NOT: { eq: "flagged" } } })).toEqual([]);
+    expect(rows.find({ where: { id: { eq: "d_1" } } })).toHaveLength(1);
+  });
+
   test("the same wrappers create a collection when no field is reserved (F020)", () => {
     const store = createStore();
     const notes = store.collection(
@@ -2568,6 +2606,21 @@ describe("the write gate", () => {
         .object({ id: zodThree.string(), NOT: zodThree.string().default("") })
         .transform((document) => document) as unknown as z.ZodType;
       expect(() => store.collection("legacy", legacyReserved)).toThrow(
+        /field "NOT" is a reserved where-clause key/,
+      );
+
+      // Zod 3 keeps a pipe's two sides on a `ZodPipeline`, Zod 4 on a `ZodPipe`;
+      // the far side is read on both.
+      const legacyPiped = zodThree
+        .object({ id: zodThree.string(), value: zodThree.string().default("") })
+        .pipe(
+          zodThree.object({
+            id: zodThree.string(),
+            value: zodThree.string(),
+            NOT: zodThree.string().default("x"),
+          }),
+        ) as unknown as z.ZodType;
+      expect(() => store.collection("legacy", legacyPiped)).toThrow(
         /field "NOT" is a reserved where-clause key/,
       );
 

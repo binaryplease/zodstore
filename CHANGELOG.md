@@ -46,6 +46,14 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
   to follow a `.transform()`, and that refusal stays load-bearing for the write
   gate's path elision — while this one answers what the schema *declares*.
 
+  The reserved-name half reads **both sides of a `.pipe()`**, because what a
+  write stores is the output side, so a pipe whose far side declares `OR` or
+  `NOT` is refused too. It remains a strong default rather than a proof: a
+  `.transform()` that *adds or renames* a field declares its output in a function
+  body, which no reader can see into, and a schema whose fields are not one
+  readable shape contributes no names. Both cases are disclosed in `README.md`,
+  in `Where`'s JSDoc and on the guard itself — do not name a field `OR` or `NOT`.
+
 - **A `ref()` keeps its identity exemption through a wrapper.** The exemption
   from the declared-default rule was carried by the schema *object* `ref()`
   returned, held in a `WeakSet`. Zod schemas are immutable, so every chained

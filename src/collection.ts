@@ -8,7 +8,12 @@ import {
   RESERVED_WHERE_KEYS,
 } from "./query.ts";
 import { isReference } from "./ref.ts";
-import { hasDeclaredDefault, readObjectShape } from "./schema-shape.ts";
+import {
+  hasDeclaredDefault,
+  MAX_WRAPPER_DEPTH,
+  readDeclaredFieldNames,
+  readObjectShape,
+} from "./schema-shape.ts";
 import type {
   IndexDefinition,
   IndexInput,
@@ -194,23 +199,27 @@ function assertIdentifier(value: string, role: string): void {
  * set for the same reason — prose that names the keys drifts where the list no
  * longer can.
  *
- * The fields come from `readObjectShape`, so the guard reaches through the
+ * The names come from `readDeclaredFieldNames`, so the guard reaches through the
  * wrappers a caller may have put around the object — `.transform()`, `.pipe()`,
  * `.brand()`, `.default()` — rather than seeing no `.shape` and enforcing
- * nothing (F020). What remains outside its reach is a schema whose fields are
- * not one shape at all: a union of object schemas, an intersection.
- * `assertDefaultsDeclared` refuses those outright, so one only reaches a
- * collection under `{ enforceDefaults: false }` — where the caller has taken
- * the schema's field names on themselves.
+ * nothing (F020), and it reads *both* sides of a `.pipe()`, because what a write
+ * stores is the output side.
+ *
+ * It remains a strong default rather than a proof, and the cases left are these:
+ * a `.transform()` that *adds or renames* a field declares its output in a
+ * function body, which no reader can see into; and a schema whose fields are not
+ * one shape at all — a union of object schemas, an intersection — contributes no
+ * names, though `assertDefaultsDeclared` refuses those outright, so one only
+ * reaches a collection under `{ enforceDefaults: false }`. In both, the field
+ * names are the caller's to keep clear of the reserved ones: **do not name a
+ * field `OR` or `NOT`.**
  */
 function assertNoReservedFieldNames(
   schema: z.ZodType,
   collectionName: string,
   idField: string,
 ): void {
-  const reading = readObjectShape(schema);
-  const fieldNames = reading.kind === "declared" ? Object.keys(reading.shape) : [];
-  for (const fieldName of [...fieldNames, idField]) {
+  for (const fieldName of [...readDeclaredFieldNames(schema), idField]) {
     if (!RESERVED_WHERE_KEYS.has(fieldName)) continue;
     const reservedList = [...RESERVED_WHERE_KEYS].map((key) => `"${key}"`).join(", ");
     throw new Error(
@@ -399,7 +408,10 @@ function unwrapSchema(schema: unknown): unknown {
   let current = schema;
   // Bounded rather than unbounded: a malformed or self-referencing schema must
   // not spin here, and no real field stacks anywhere near this many wrappers.
-  for (let depth = 0; depth < 10; depth += 1) {
+  // The bound is the one `src/schema-shape.ts` peels to, imported rather than
+  // written out a second time — two literals that have to agree is the shape of
+  // F051 in miniature.
+  for (let depth = 0; depth < MAX_WRAPPER_DEPTH; depth += 1) {
     const definition =
       (current as { _zod?: { def?: { innerType?: unknown } } } | undefined)?._zod?.def ??
       (current as { _def?: { innerType?: unknown } } | undefined)?._def;

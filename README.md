@@ -307,11 +307,15 @@ a row whose `name` is `null`, because `null = 'Ann'` is unknown rather than fals
 The keys are uppercase so they cannot be mistaken for fields, and `store.collection(...)`
 refuses an **object** schema carrying a field named `OR` or `NOT` — including one under a
 wrapper that hides its `.shape`, such as `.transform()`, `.pipe()`, `.brand()` or
-`.default()`. A schema whose fields are not one readable shape — a union of object
-schemas, an intersection — only reaches a collection under `{ enforceDefaults: false }`
-(see [Forward compatibility](#forward-compatibility-no-migrations)), and there the field
-names are yours to keep
-clear of these two.
+`.default()`, and on both sides of a `.pipe()`.
+
+That guard is a **strong default rather than a proof**, so do not name a field `OR` or
+`NOT`. Two cases are left: a `.transform()` that *adds or renames* a field declares its
+output in a function body, which no reader can see into, and a schema whose fields are not
+one readable shape — a union of object schemas, an intersection — contributes no names and
+only reaches a collection under `{ enforceDefaults: false }`
+(see [Forward compatibility](#forward-compatibility-no-migrations)). In both, the field
+names are yours to keep clear of these two.
 
 A `where` is a nested, JSON-shaped structure, and it is a plain TypeScript type rather
 than a Zod schema — the deliberate in-process exception to Zod owning every shape,
@@ -518,6 +522,11 @@ z.object({ id: ref("post"), authorId: ref("user").nullable() });   // accepted, 
 `.default(...)` on a reference ends it: a defaulted foreign key invents a reference to a
 row that may not exist, so it is held to the ordinary rule — which it passes, because it
 declares a default.
+
+Prefer `.nullable()` over `.optional()` for a stored reference. Both are accepted, but an
+absent `.optional()` is dropped from the row by `JSON.stringify`, so the stored key set
+varies row to row — the incompleteness the rule below exists to prevent — while
+`.nullable()` stores the explicit `null` you want anyway.
 
 Reopening a collection may extend the schema and may declare further indexes, which are
 cumulative across handles. It may **not** change `idField`: identity is what the stored

@@ -49,6 +49,8 @@ interface SchemaDefinition {
   innerType?: unknown;
   /** The declared input side of Zod 4's `ZodPipe` and Zod 3's `ZodPipeline`. */
   in?: unknown;
+  /** Its output side — an object for a `.pipe()`, the transform for a `.transform()`. */
+  out?: unknown;
   /** The wrapped schema of Zod 3's `ZodEffects` — `.transform()`, `.refine()`. */
   schema?: unknown;
   /** The branded schema under Zod 3's `ZodBranded`; a string type name under Zod 4. */
@@ -76,9 +78,11 @@ function readDefinition(schema: unknown): SchemaDefinition | undefined {
  * The schema one wrapper wraps, or `undefined` when this is not a wrapper.
  *
  * A pipe is followed on its **declared input side**: that is the shape an
- * already-stored row is parsed against, which is the side both collection rules
- * are about. A `.pipe()` whose output object renames the input's fields is
- * therefore read as what it accepts rather than as what it produces.
+ * already-stored row is parsed against, which is the side the declared-default
+ * rule is about. A `.pipe()` whose output object renames or adds fields is
+ * therefore read here as what it accepts rather than as what it produces —
+ * `readDeclaredFieldNames` below reads both sides for the guard that needs
+ * them.
  *
  * Zod 3's `ZodBranded` keeps its schema under `type`, which Zod 4 uses for a
  * type *name* and Zod 3's `ZodArray` uses for its element — so that key is only
@@ -158,6 +162,40 @@ export function readObjectShape(schema: unknown, depth = 0): SchemaShape {
   const inner = innerDeclaredSchema(schema);
   if (inner === undefined) return { kind: "none" };
   return readObjectShape(inner, depth + 1);
+}
+
+/**
+ * Every field name a schema declares on **either** side of a pipe, for the
+ * guard that cares about names rather than about the schemas behind them.
+ *
+ * A stored row is parsed against the input side, but what `insert` writes is the
+ * *output*, so a name the where-grammar reserves matters wherever it appears. A
+ * `.pipe(input, output)` therefore contributes both shapes; a `.transform()`
+ * contributes only its input, because its output side is a function and no
+ * reader can say what a function returns without running it. That residue is
+ * disclosed where the guard is documented rather than claimed closed.
+ *
+ * A composite (a union, an intersection) contributes nothing, exactly as
+ * `readObjectShape` answers `"opaque"` for one: such a schema only reaches a
+ * collection under `{ enforceDefaults: false }`, where its field names are the
+ * caller's.
+ */
+export function readDeclaredFieldNames(schema: unknown, depth = 0): string[] {
+  if (depth >= MAX_WRAPPER_DEPTH) return [];
+
+  const shape = (schema as { shape?: Record<string, z.ZodType> } | undefined)?.shape;
+  if (typeof shape === "object" && shape !== null) return Object.keys(shape);
+
+  const definition = readDefinition(schema);
+  if (definition !== undefined && (definition.in !== undefined || definition.out !== undefined)) {
+    return [
+      ...readDeclaredFieldNames(definition.in, depth + 1),
+      ...readDeclaredFieldNames(definition.out, depth + 1),
+    ];
+  }
+
+  const inner = innerDeclaredSchema(schema);
+  return inner === undefined ? [] : readDeclaredFieldNames(inner, depth + 1);
 }
 
 /**

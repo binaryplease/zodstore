@@ -88,6 +88,12 @@ export function isReference(schema: z.ZodType): boolean {
  * z.object({ id: ref("post"), authorId: ref("user").nullable() });
  * ```
  *
+ * Prefer `.nullable()` over `.optional()` for a *stored* reference. Both keep
+ * the exemption, but an absent optional is dropped from the row by
+ * `JSON.stringify`, so the stored key set varies row to row — the very
+ * incompleteness the declared-default rule exists to prevent — while a nullable
+ * one stores the explicit `null`.
+ *
  * A `.default(...)` on a reference is **not** identity-shaped any more: it
  * invents a reference to a row that may not exist, which is what the exemption
  * exists to prevent. Such a field is held to the ordinary rule instead — and it
