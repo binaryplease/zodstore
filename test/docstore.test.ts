@@ -257,6 +257,167 @@ describe("find — typed where-clause", () => {
   });
 });
 
+// F042 — `ne` compiled to a bare `<> ?` and `notIn` to a bare `NOT IN (…)`, and
+// in SQL both evaluate to NULL rather than true against a NULL left side. A
+// WHERE keeps only what evaluates to true, so every row with no value fell
+// silently out of the exclusion half of the operator table — and survived the
+// `deleteMany({ field: { ne: "keep" } })` retention sweep that spells it on the
+// write path.
+describe("ne and notIn keep the null-valued rows (F042)", () => {
+  function seeded() {
+    const { users } = freshUsers();
+    users.insertMany([
+      { id: "user_mine", age: 20, active: true, nickname: "mine" },
+      { id: "user_yours", age: 30, active: false, nickname: "yours" },
+      // The schema the mandatory-defaults rule pushes a caller toward:
+      // `z.string().nullable().default(null)`, so this row stores a JSON null.
+      { id: "user_unset", age: 40, active: true, nickname: null },
+    ]);
+    return users;
+  }
+
+  test("ne returns the row with no value, through find, findOne and count", () => {
+    const users = seeded();
+    expect(users.find({ where: { nickname: { ne: "mine" } } }).map((user) => user.id)).toEqual([
+      "user_yours",
+      "user_unset",
+    ]);
+    expect(
+      users.findOne({ where: { nickname: { ne: "mine" } }, orderBy: { field: "age", direction: "desc" } })?.id,
+    ).toBe("user_unset");
+    expect(users.count({ nickname: { ne: "mine" } })).toBe(2);
+  });
+
+  test("notIn returns the row with no value, through find, findOne and count", () => {
+    const users = seeded();
+    expect(
+      users.find({ where: { nickname: { notIn: ["mine"] } } }).map((user) => user.id),
+    ).toEqual(["user_yours", "user_unset"]);
+    expect(
+      users.find({ where: { nickname: { notIn: ["mine", "yours"] } } }).map((user) => user.id),
+    ).toEqual(["user_unset"]);
+    expect(users.findOne({ where: { nickname: { notIn: ["mine", "yours"] } } })?.id).toBe(
+      "user_unset",
+    );
+    expect(users.count({ nickname: { notIn: ["mine", "yours"] } })).toBe(1);
+  });
+
+  test("the same clause under deleteMany removes the named rows only", () => {
+    // Asserted by surviving ids, not by the returned count: the count is what
+    // the broken filter also reported truthfully about its own narrower answer.
+    const byNe = seeded();
+    byNe.deleteMany({ nickname: { ne: "mine" } });
+    expect(byNe.find().map((user) => user.id)).toEqual(["user_mine"]);
+
+    const byNotIn = seeded();
+    byNotIn.deleteMany({ nickname: { notIn: ["mine"] } });
+    expect(byNotIn.find().map((user) => user.id)).toEqual(["user_mine"]);
+  });
+
+  test("eq: null, ne: null and isNull keep their current meanings", () => {
+    const users = seeded();
+    expect(users.find({ where: { nickname: null } }).map((user) => user.id)).toEqual([
+      "user_unset",
+    ]);
+    expect(users.find({ where: { nickname: { eq: null } } }).map((user) => user.id)).toEqual([
+      "user_unset",
+    ]);
+    expect(users.find({ where: { nickname: { ne: null } } }).map((user) => user.id)).toEqual([
+      "user_mine",
+      "user_yours",
+    ]);
+    expect(users.find({ where: { nickname: { isNull: true } } }).map((user) => user.id)).toEqual([
+      "user_unset",
+    ]);
+  });
+
+  test("a null in an in / notIn list names the rows that have no value", () => {
+    const users = seeded();
+    // The singleton spellings and the list spellings answer the same question.
+    expect(users.find({ where: { nickname: { in: [null] } } }).map((user) => user.id)).toEqual([
+      "user_unset",
+    ]);
+    expect(users.find({ where: { nickname: { notIn: [null] } } }).map((user) => user.id)).toEqual([
+      "user_mine",
+      "user_yours",
+    ]);
+    expect(
+      users.find({ where: { nickname: { in: ["mine", null] } } }).map((user) => user.id),
+    ).toEqual(["user_mine", "user_unset"]);
+    // Neither "mine" nor unset — and the exact complement of the line above.
+    expect(
+      users.find({ where: { nickname: { notIn: ["mine", null] } } }).map((user) => user.id),
+    ).toEqual(["user_yours"]);
+  });
+
+  test("the rewritten predicate is parenthesised, so nesting cannot re-scope it", () => {
+    const users = seeded();
+    // A sibling AND is where a missing paren shows: unparenthesised this reads
+    // `(active AND nickname IS NULL) OR nickname <> ?`, which returns the
+    // inactive "yours" row the `active: true` sibling exists to exclude.
+    expect(
+      users.find({ where: { active: true, nickname: { ne: "mine" } } }).map((user) => user.id),
+    ).toEqual(["user_unset"]);
+    expect(
+      users
+        .find({ where: { OR: [{ nickname: { ne: "mine" } }, { age: 20 }] } })
+        .map((user) => user.id),
+    ).toEqual(["user_mine", "user_yours", "user_unset"]);
+    // NOT of the rewritten predicate is the named set itself — the null-valued
+    // row is inside the negation, not stranded outside both halves.
+    expect(
+      users.find({ where: { NOT: { nickname: { ne: "mine" } } } }).map((user) => user.id),
+    ).toEqual(["user_mine"]);
+    expect(
+      users
+        .find({ where: { NOT: { active: true, nickname: { ne: "mine" } } } })
+        .map((user) => user.id),
+    ).toEqual(["user_mine", "user_yours"]);
+    expect(
+      users
+        .find({ where: { NOT: { nickname: { notIn: ["mine", "yours"] } } } })
+        .map((user) => user.id),
+    ).toEqual(["user_mine", "user_yours"]);
+  });
+
+  test("an absent key answers as a stored null does, because json_extract cannot tell them apart", () => {
+    // A field added by an extended schema is absent from every row written
+    // before it existed, and `json_extract` returns SQL NULL for an absent key
+    // exactly as it does for a stored JSON null — so the documented semantic is
+    // that the two are one and the same to a where-clause.
+    //
+    // Whether the *default* the extended schema declares should show through to
+    // a SQL-side filter instead is the open question of #4 (F041), which is
+    // independent of this one and deliberately not decided here.
+    const store = createStore();
+    const oldPeople = store.collection(
+      "people",
+      z.object({ id: ref("user"), name: z.string().default("") }),
+    );
+    oldPeople.insert({ id: "user_legacy", name: "Legacy" });
+
+    const newPeople = store.collection(
+      "people",
+      z.object({
+        id: ref("user"),
+        name: z.string().default(""),
+        nickname: z.string().nullable().default(null),
+      }),
+    );
+    newPeople.insert({ id: "user_fresh", name: "Fresh", nickname: "mine" });
+
+    expect(
+      newPeople.find({ where: { nickname: { ne: "mine" } } }).map((person) => person.id),
+    ).toEqual(["user_legacy"]);
+    expect(
+      newPeople.find({ where: { nickname: { notIn: ["mine"] } } }).map((person) => person.id),
+    ).toEqual(["user_legacy"]);
+    expect(
+      newPeople.find({ where: { nickname: null } }).map((person) => person.id),
+    ).toEqual(["user_legacy"]);
+  });
+});
+
 describe("escaped LIKE operands (F009)", () => {
   const RowSchema = z.object({ id: ref("row"), name: z.string().default("") });
 
@@ -1525,6 +1686,64 @@ describe("compileWhere — unit", () => {
       parameters: [1, 2],
     });
     expect(compileWhere({ age: { notIn: [] } })).toEqual({ sql: "WHERE 1", parameters: [] });
+  });
+
+  test("ne and notIn name the null case, parenthesised (F042)", () => {
+    const nickname = "json_extract(doc, '$.nickname')";
+    expect(compileWhere({ nickname: { ne: "mine" } })).toEqual({
+      sql: `WHERE (${nickname} IS NULL OR ${nickname} <> ?)`,
+      parameters: ["mine"],
+    });
+    expect(compileWhere({ nickname: { notIn: ["mine", "yours"] } })).toEqual({
+      sql: `WHERE (${nickname} IS NULL OR ${nickname} NOT IN (?, ?))`,
+      parameters: ["mine", "yours"],
+    });
+    // The parentheses are load-bearing, because every combinator nests this
+    // predicate: `AND` binds tighter than `OR`, so an unparenthesised compound
+    // re-scopes the clause around it and turns narrowing into widening.
+    expect(compileWhere({ active: true, nickname: { ne: "mine" } })).toEqual({
+      sql: `WHERE json_extract(doc, '$.active') = ? AND (${nickname} IS NULL OR ${nickname} <> ?)`,
+      parameters: [1, "mine"],
+    });
+    expect(compileWhere({ OR: [{ nickname: { ne: "mine" } }, { age: 20 }] })).toEqual({
+      sql: `WHERE ((${nickname} IS NULL OR ${nickname} <> ?) OR json_extract(doc, '$.age') = ?)`,
+      parameters: ["mine", 20],
+    });
+    expect(compileWhere({ NOT: { nickname: { ne: "mine" } } })).toEqual({
+      sql: `WHERE NOT ((${nickname} IS NULL OR ${nickname} <> ?))`,
+      parameters: ["mine"],
+    });
+    // The null operand is untouched: `ne: null` is still the plain IS NOT NULL.
+    expect(compileWhere({ nickname: { ne: null } })).toEqual({
+      sql: `WHERE ${nickname} IS NOT NULL`,
+      parameters: [],
+    });
+  });
+
+  test("a null in an in / notIn list names the absence, not a parameter (F042)", () => {
+    const nickname = "json_extract(doc, '$.nickname')";
+    // A list naming nothing but the absence is the singleton spelling of it.
+    expect(compileWhere({ nickname: { in: [null] } })).toEqual({
+      sql: `WHERE ${nickname} IS NULL`,
+      parameters: [],
+    });
+    expect(compileWhere({ nickname: { notIn: [null] } })).toEqual({
+      sql: `WHERE ${nickname} IS NOT NULL`,
+      parameters: [],
+    });
+    // A mixed list binds only the comparable values; the null is carried by the
+    // IS NULL test, because no row equals a bound NULL.
+    expect(compileWhere({ nickname: { in: ["mine", null] } })).toEqual({
+      sql: `WHERE (${nickname} IS NULL OR ${nickname} IN (?))`,
+      parameters: ["mine"],
+    });
+    expect(compileWhere({ nickname: { notIn: ["mine", null] } })).toEqual({
+      sql: `WHERE (${nickname} IS NOT NULL AND ${nickname} NOT IN (?))`,
+      parameters: ["mine"],
+    });
+    // The empty list still decides without comparing: no rows, every row.
+    expect(compileWhere({ nickname: { in: [] } })).toEqual({ sql: "WHERE 0", parameters: [] });
+    expect(compileWhere({ nickname: { notIn: [] } })).toEqual({ sql: "WHERE 1", parameters: [] });
   });
 });
 

@@ -13,7 +13,11 @@ export type SqlParameter = string | number | null;
 export interface FieldOperators<TValue> {
   /** Equal. `eq: null` compiles to `IS NULL`. */
   eq?: TValue;
-  /** Not equal. `ne: null` compiles to `IS NOT NULL`. */
+  /**
+   * Not equal. `ne: null` compiles to `IS NOT NULL`; on any other operand the
+   * null-valued rows are kept, because a row with no value is not the named one
+   * (F042).
+   */
   ne?: TValue;
   /** Greater than. */
   gt?: TValue;
@@ -23,9 +27,16 @@ export interface FieldOperators<TValue> {
   lt?: TValue;
   /** Less than or equal. */
   lte?: TValue;
-  /** Membership. An empty list matches nothing. */
+  /**
+   * Membership. An empty list matches nothing. A `null` in the list names the
+   * rows that have no value, so `in: [null]` is `eq: null`.
+   */
   in?: readonly TValue[];
-  /** Exclusion. An empty list matches everything. */
+  /**
+   * Exclusion. An empty list matches everything, and the null-valued rows are
+   * kept unless the list names `null` — they are outside the named set, not
+   * outside the answer (F042). `notIn: [null]` is `ne: null`.
+   */
   notIn?: readonly TValue[];
   /**
    * A **raw** SQL `LIKE` pattern (string fields), the expert escape hatch:

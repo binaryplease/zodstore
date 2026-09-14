@@ -112,6 +112,42 @@ outside years 0000–9999 (whose expanded ISO form would not order against store
 timestamps — `dateParser` refuses to store one either), is refused naming the
 operator or field at fault.
 
+### `ne` and `notIn` keep the null-valued rows
+
+**A row with no value is excluded from the named *set*, not from the *answer*.** `ne` and
+`notIn` are total over the nullable domain: a `null` is not the value you named, so it
+comes back.
+
+```ts
+users.insert({ id: "user_1", nickname: "mine" });
+users.insert({ id: "user_2", nickname: null });
+
+users.find({ where: { nickname: { ne: "mine" } } });        // → [user_2]
+users.find({ where: { nickname: { notIn: ["mine"] } } });   // → [user_2]
+users.deleteMany({ nickname: { ne: "keep" } });             // removes both, not just user_1
+```
+
+This is not what raw SQL does — `NULL <> 'mine'` and `NULL NOT IN ('mine')` are both
+*unknown*, which a `WHERE` drops — so the compiled predicate names the null case
+explicitly (`(expr IS NULL OR expr <> ?)`). Until it did, the null-valued rows vanished
+from every exclusion filter and survived every `deleteMany` built on one (F042). Two
+consequences of that, both deliberate:
+
+- **A stored `null` and an absent key are the same thing here.** `json_extract` returns SQL
+  `NULL` for a JSON `null` and for a key that is not in the document, so `eq: null`,
+  `isNull: true`, `ne` and `notIn` cannot tell them apart and do not try. A field added by
+  an extended schema reads as absent on every row written before it existed, and reads as
+  `null` under these operators — see
+  [Forward compatibility](#forward-compatibility-no-migrations).
+- **A `null` inside an `in`/`notIn` list names that same "no value".** It is a member of
+  the set rather than a bound parameter nothing can equal, so `in: [null]` means
+  `eq: null`, `notIn: [null]` means `ne: null`, and `notIn: ["mine", null]` returns the
+  rows that are neither `"mine"` nor unset. The two operators are exact complements of one
+  another at every list shape.
+
+`eq: null`, `ne: null` and `isNull` are unchanged. `NOT` is still SQL's `NOT` over whatever
+it wraps — see [`OR` and `NOT`](#or-and-not).
+
 ### An absent value narrows
 
 **A condition whose value is `undefined` matches nothing.** Filters get built from state

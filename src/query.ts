@@ -149,6 +149,36 @@ function isOperatorObject(condition: unknown): condition is FieldOperators<unkno
   return keys.length > 0 && keys.every((key) => KNOWN_OPERATORS.has(key as keyof FieldOperators<unknown>));
 }
 
+/**
+ * Compile one operator into a boolean expression over `expression`, appending it
+ * to `conditions` and its bound values to `parameters`.
+ *
+ * **The exclusion operators are total over the nullable domain (F042).** A row
+ * whose stored value is SQL `NULL` is excluded from the named *set*, not from
+ * the *answer*. Bare `<> ?` and `NOT IN (…)` evaluate to `NULL` — not true —
+ * against a `NULL` left side, and a `WHERE` keeps only what evaluates to true,
+ * so every null-valued row used to fall silently out of `ne` and `notIn`, and
+ * out of the `deleteMany({ field: { ne: "keep" } })` retention sweep that spells
+ * the same clause on the write path. Both now admit those rows explicitly.
+ *
+ * Two semantics that follow from it, stated here rather than left to be
+ * discovered:
+ *
+ * - **A stored JSON `null` and an absent key stay indistinguishable.**
+ *   `json_extract` returns SQL `NULL` for both, so every operator in this
+ *   function reads them as one and the same "no value" — which is what
+ *   `eq: null` and `isNull` already did.
+ * - **A `null` inside an `in`/`notIn` list names that same "no value" as a
+ *   member of the set**, rather than binding a parameter nothing can equal.
+ *   `in: [null]` therefore means `eq: null` and `notIn: [null]` means
+ *   `ne: null`, and the two operators stay exact complements at every list
+ *   shape.
+ *
+ * Every compound predicate is emitted **already parenthesised**, because the
+ * combinators nest it: a bare `expr IS NULL OR expr <> ?` binds loosely enough
+ * under a sibling `AND`, an `OR` branch or a `NOT` to re-scope the clause it
+ * sits in, which turns a narrowing filter into a widening one.
+ */
 function compileOperator(
   expression: string,
   operator: keyof FieldOperators<unknown>,
@@ -169,7 +199,8 @@ function compileOperator(
       if (operand === null) {
         conditions.push(`${expression} IS NOT NULL`);
       } else {
-        conditions.push(`${expression} <> ?`);
+        // A row with no value is not the named one, so it belongs in the answer.
+        conditions.push(`(${expression} IS NULL OR ${expression} <> ?)`);
         parameters.push(toSqlParameter(operand, `operator "${operator}"`));
       }
       return;
@@ -190,10 +221,37 @@ function compileOperator(
         conditions.push(operator === "in" ? "0" : "1");
         return;
       }
-      const placeholders = values.map(() => "?").join(", ");
+      // A `null` in the list names the rows that have no value — nothing a bound
+      // parameter can equal, so it is carried by an `IS NULL` test instead of a
+      // placeholder, and only the comparable values reach the `IN (…)`.
+      const namesTheAbsence = values.some((value) => value === null);
+      const comparableValues = values.filter((value) => value !== null);
+      if (comparableValues.length === 0) {
+        // The list named nothing but the absence, so that test is the whole
+        // predicate: `in: [null]` is `eq: null`, `notIn: [null]` is `ne: null`.
+        conditions.push(
+          operator === "in" ? `${expression} IS NULL` : `${expression} IS NOT NULL`,
+        );
+        return;
+      }
+      const placeholders = comparableValues.map(() => "?").join(", ");
       const keyword = operator === "in" ? "IN" : "NOT IN";
-      conditions.push(`${expression} ${keyword} (${placeholders})`);
-      for (const value of values) {
+      const membership = `${expression} ${keyword} (${placeholders})`;
+      if (operator === "in") {
+        conditions.push(
+          namesTheAbsence ? `(${expression} IS NULL OR ${membership})` : membership,
+        );
+      } else {
+        // `notIn` drops the null-valued rows only when the list named the
+        // absence; otherwise they are outside the named set and the answer keeps
+        // them, which a bare `NOT IN (…)` never did (F042).
+        conditions.push(
+          namesTheAbsence
+            ? `(${expression} IS NOT NULL AND ${membership})`
+            : `(${expression} IS NULL OR ${membership})`,
+        );
+      }
+      for (const value of comparableValues) {
         parameters.push(toSqlParameter(value, `operator "${operator}"`));
       }
       return;

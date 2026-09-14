@@ -9,6 +9,60 @@ was nothing to name, so "which docstore is this?" could only be answered by
 diffing trees (F008). Releases from `0.4.2` on are published to npm as
 `@binaryplease/zodstore`.
 
+## Unreleased
+
+### Fixed
+
+- **`ne` and `notIn` no longer drop the rows whose value is `NULL`.** Both
+  compiled to the bare SQL predicate — `expr <> ?` and `expr NOT IN (…)` — and
+  in SQL each of those evaluates to `NULL`, not true, when the left side is
+  `NULL`. A `WHERE` keeps only what evaluates to true, so every row with no
+  value silently fell out of the answer to an *exclusion* filter, while the
+  inclusion half (`eq`, `in`) answered exactly what it looked like it answered.
+  Nothing in the types, the JSDoc or the README hinted at the asymmetry, and the
+  operand the caller wrote was not null, so there was no cue at the call site
+  either (F042, [#5](https://github.com/binaryplease/zodstore/issues/5)).
+
+  ```ts
+  users.insert({ id: "user_1", nickname: "mine" });
+  users.insert({ id: "user_2", nickname: null });
+
+  users.find({ where: { nickname: { ne: "mine" } } });       // was [] , now [user_2]
+  users.find({ where: { nickname: { notIn: ["mine"] } } });  // was [] , now [user_2]
+  ```
+
+  The schema that triggers it — `z.string().nullable().default(null)` — is the
+  one this library's own mandatory-defaults rule pushes a caller toward, and the
+  consequence is worst on the write path: `deleteMany({ field: { ne: "keep" } })`
+  is the retention shape, and it deleted the named rows while silently sparing
+  every null-valued one. A store that must prove what it deleted cannot do so
+  through a sweep that skips a subset.
+
+  Both operators are now **total over the nullable domain**: a row with no value
+  is excluded from the named *set*, not from the *answer*. `ne` on a non-null
+  operand compiles to `(expr IS NULL OR expr <> ?)` and `notIn` wraps its
+  `NOT IN` the same way. The compound predicates are emitted already
+  parenthesised, so nesting them under a sibling `AND`, an `OR` branch or a
+  `NOT` cannot re-scope them. `eq: null`, `ne: null`, `isNull` and every
+  inclusion filter are unchanged, as is an `in`/`notIn` list of non-null values.
+
+### Changed
+
+- **A `null` inside an `in`/`notIn` list now names the rows that have no
+  value.** It used to bind as a parameter, and no row equals a bound `NULL`, so
+  `in: [null]` matched nothing and `notIn: [null]` excluded nothing — the list
+  form disagreed with the singleton form of the same question. `null` is now a
+  member of the named set, carried by an `IS NULL` test rather than a
+  placeholder: `in: [null]` means `eq: null`, `notIn: [null]` means `ne: null`,
+  and `notIn: ["mine", null]` returns the rows that are neither. This is the
+  decision `F042` asked to be made deliberately rather than inherited; without
+  it, `in` and `notIn` would not be complements of each other at a list
+  containing `null`.
+- **A stored JSON `null` and an absent key are documented as indistinguishable**
+  to the where-clause. `json_extract` returns SQL `NULL` for both, which is what
+  `eq: null` always did; `README.md` and the `FieldOperators` JSDoc now state it
+  instead of leaving it to be discovered. No behaviour changes.
+
 ## 0.4.2 — 2026-08-31
 
 ### Changed
