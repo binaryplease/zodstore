@@ -13,6 +13,47 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
 
 ### Fixed
 
+- **An `in`/`notIn` list no longer retains a prepared statement per distinct
+  length.** The element *count* was part of the SQL text — `in` over three values
+  and `in` over four were two statements — and `bun:sqlite` caches one prepared
+  statement per distinct SQL string, with no eviction, for the life of the
+  `Database`. `findByIds` spelled the same thing for its batch size. This is the
+  axis F024 left open when it bound the page bounds, and it is the worse of the
+  two: the list length is what an endpoint forwards from `?ids=a,b,c` or a
+  multi-select filter, so the cardinality of that cache was the caller's to choose
+  rather than the code's, and the cost is quadratic in the longest list seen
+  because each retained statement is itself proportional to its arity. Measured
+  over lengths 1..2000 against a fixed-length control: ~240 MB retained on
+  `find({ where: { id: { in: … } } })` and ~125 MB on `findByIds`, against ~0.5 MB
+  (F027, [#3](https://github.com/binaryplease/zodstore/issues/3)).
+
+  The list now binds as a **single JSON array parameter**, read back by
+  `json_each`, so one statement covers every length:
+
+  ```sql
+  -- was, one statement per length, per operator, per null-presence
+  json_extract(doc, '$.id') IN (?, ?, ?)
+  -- now
+  json_extract(doc, '$.id') IN (SELECT value FROM json_each(?))
+  ```
+
+  Measured before it was chosen, against padding the list up to a power-of-two
+  bucket: the subquery form removes the axis outright where padding only bounds
+  it at ~16 statements per form, and `EXPLAIN QUERY PLAN` reports the same
+  `SEARCH … USING INDEX (id=?)` for both — on the `id` primary key and on a
+  declared `json_extract` expression index alike, which is the difference between
+  this and a table scan. The suite asserts the plan.
+
+  **No change to what any list returns**, at any length: an empty `in` still
+  matches nothing and an empty `notIn` everything, `in: [null]` is still
+  `eq: null` and `notIn: [null]` still `ne: null`, the two operators are still
+  exact complements at every list shape, and `findByIds` still dedupes and
+  preserves the order of first appearance. Values still travel as bound data —
+  the array is one TEXT parameter SQLite parses, so no element reaches the
+  statement text. One list that used to fail now works: past SQLite's bound on
+  how many parameters a statement may carry — 65 535, measured on the SQLite Bun
+  ships rather than assumed — the placeholder run refused the query, and a single
+  bound array has no such ceiling.
 - **The declared-default guard now walks a schema all the way down.** It read one
   shape and stopped, so a member nested inside a defaulted object was never asked
   for a default of its own — and a parent's `.default(…)` does not cover it: a row

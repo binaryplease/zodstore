@@ -2,8 +2,10 @@ import type { Database } from "bun:sqlite";
 import type { z } from "zod";
 import {
   compileLimitOffset,
+  compileMembership,
   compileOrderBy,
   compileWhere,
+  encodeMembershipList,
   jsonExtract,
   RESERVED_WHERE_KEYS,
 } from "./query.ts";
@@ -861,6 +863,14 @@ export function createQualifiedCollection<TSchema extends z.ZodType>(
     `INSERT OR REPLACE INTO ${quotedTable} (id, doc) VALUES (?, ?)`,
   );
   const getStatement = database.query(`SELECT doc FROM ${quotedTable} WHERE id = ?`);
+  // One statement for every batch size (F027). The ids bind as a single JSON
+  // array rather than one placeholder each, so this SQL no longer varies with
+  // how many ids a caller passes — which is what let a caller-chosen batch size
+  // mint an uncollected prepared statement per distinct size. It can be
+  // prepared here, once, precisely because there is only one of it now.
+  const findByIdsStatement = database.query(
+    `SELECT id, doc FROM ${quotedTable} WHERE ${compileMembership("id", "IN")}`,
+  );
   const updateStatement = database.query(
     `UPDATE ${quotedTable} SET doc = ? WHERE id = ?`,
   );
@@ -1077,10 +1087,9 @@ export function createQualifiedCollection<TSchema extends z.ZodType>(
   function findByIds(ids: readonly string[]): TDocument[] {
     const uniqueIds = [...new Set(ids)];
     if (uniqueIds.length === 0) return [];
-    const placeholders = uniqueIds.map(() => "?").join(", ");
-    const rows = database
-      .query(`SELECT id, doc FROM ${quotedTable} WHERE id IN (${placeholders})`)
-      .all(...uniqueIds) as Array<{ id: string; doc: string }>;
+    const rows = findByIdsStatement.all(
+      encodeMembershipList(uniqueIds, `findByIds on collection "${name}"`),
+    ) as Array<{ id: string; doc: string }>;
     const byId = new Map<string, TDocument>();
     for (const row of rows) {
       const document = readRow(row.id, row.doc);

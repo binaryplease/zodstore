@@ -27,6 +27,7 @@ import {
   type FieldOperators,
   populate,
   ref,
+  type SqlParameter,
   transactionAcross,
 } from "../src/index.ts";
 // Not part of the published surface — `src/index.ts` deliberately does not
@@ -34,7 +35,23 @@ import {
 // (F051). The suite reads it from the module that owns it, which is the point:
 // a test that hardcoded the same two strings would be the third copy of the
 // list this change exists to collapse.
-import { RESERVED_WHERE_KEYS } from "../src/query.ts";
+// The same two, for the same reason: `compileMembership` and
+// `encodeMembershipList` describe how a list reaches SQL rather than the
+// library's surface, and the F027 plan assertion reads them from the module that
+// owns them so it cannot assert a fragment the compiler has stopped emitting.
+import {
+  compileMembership,
+  encodeMembershipList,
+  RESERVED_WHERE_KEYS,
+} from "../src/query.ts";
+
+/**
+ * The subquery an `in`/`notIn` list compiles to, spelled once (F027). The list
+ * binds as a single JSON array, so this fragment is the same at every length —
+ * which is the whole property, and the reason the SQL-shape assertions below can
+ * name it rather than a placeholder run.
+ */
+const MEMBERSHIP_SOURCE = "SELECT value FROM json_each(?)";
 
 function inTemporaryDirectory<TResult>(work: (directory: string) => TResult): TResult {
   const directory = mkdtempSync(join(tmpdir(), "docstore-"));
@@ -1702,6 +1719,322 @@ describe("the paged read path (F024, F025)", () => {
   });
 });
 
+// F027 — the other unbounded axis into the same cache F024 closed for the page
+// bounds. The element *count* of an `in`/`notIn` list was part of the SQL text,
+// so `in` over three values and `in` over four were two statements, and
+// `Database.query()` keeps one prepared statement per distinct SQL string for
+// the life of the connection with no eviction. `findByIds` spelled the same
+// thing for its batch size.
+//
+// Worse than F024 on two counts. The length is what an endpoint forwards from
+// `?ids=a,b,c` or a multi-select filter, so the cardinality of that cache is the
+// caller's to choose rather than the code's; and the growth is quadratic in the
+// longest list seen, because each retained statement is itself proportional to
+// its arity. The issue measured 122 MB retained over arities 1..2000 against
+// 0.9 MB for a fixed-arity control.
+//
+// The list now binds as a single JSON array read back by `json_each`, so the
+// statement is the same at every length — measured against padding the list up
+// to a power-of-two bucket, which caps the cache at ~16 statements per form but
+// still retains the largest of them and has to special-case
+// SQLITE_MAX_VARIABLE_NUMBER. The subquery form was chosen because the query
+// plan holds (asserted below) and it removes the axis outright rather than
+// bounding it.
+describe("the membership read path (F027)", () => {
+  const MemberSchema = z.object({
+    id: ref("m"),
+    tag: z.string().nullable().default(null),
+  });
+
+  /**
+   * `rowCount` rows whose tags cycle through ten values, with every fifth row
+   * carrying no tag at all — so the null-bearing forms have rows to include and
+   * exclude at every list length rather than only at the ends.
+   */
+  function seeded(rowCount: number) {
+    const store = createStore();
+    const members = store.collection("members", MemberSchema, { indexes: ["tag"] });
+    members.insertMany(
+      Array.from({ length: rowCount }, (_unused, index) => ({
+        id: `m_${index}`,
+        tag: index % 5 === 0 ? null : `t_${index % 10}`,
+      })),
+    );
+    return { store, members };
+  }
+
+  const byId = { field: "id" } as const;
+
+  test("in and notIn answer the same at every length from 0 to 300", () => {
+    const { members } = seeded(40);
+    const stored = members.find({ orderBy: byId });
+    // A pool that overlaps the stored tags at its head and runs far past them,
+    // so the sweep covers a list shorter than the tag set, one that matches it
+    // exactly, and one much longer than the collection.
+    const pool = Array.from({ length: 300 }, (_unused, index) => `t_${index}`);
+    const idsWhere = (where: Record<string, unknown>) =>
+      members.find({ where: where as never, orderBy: byId }).map((member) => member.id);
+    const idsWhen = (keep: (tag: string | null) => boolean) =>
+      stored.filter((member) => keep(member.tag)).map((member) => member.id);
+
+    for (let length = 0; length <= pool.length; length += 1) {
+      const list = pool.slice(0, length);
+      const named = new Set(list);
+      // The oracle is the same set membership computed in JavaScript, which is
+      // what the unquantised placeholder run computed in SQL. It closes over the
+      // empty list too: an empty `in` names nothing, an empty `notIn` excludes
+      // nothing, which is exactly `named` being empty.
+      expect(idsWhere({ tag: { in: list } })).toEqual(
+        idsWhen((tag) => tag !== null && named.has(tag)),
+      );
+      expect(idsWhere({ tag: { notIn: list } })).toEqual(
+        idsWhen((tag) => tag === null || !named.has(tag)),
+      );
+      // The second axis the cache keyed on (#15): a `null` in the list names the
+      // rows that have no value, and the two operators stay exact complements at
+      // every length. At length 0 these are `in: [null]` ≡ `eq: null` and
+      // `notIn: [null]` ≡ `ne: null`.
+      const withNull = [...list, null];
+      expect(idsWhere({ tag: { in: withNull } })).toEqual(
+        idsWhen((tag) => tag === null || named.has(tag)),
+      );
+      expect(idsWhere({ tag: { notIn: withNull } })).toEqual(
+        idsWhen((tag) => tag !== null && !named.has(tag)),
+      );
+      // Complementary as sets, at this length, in both null-presence forms.
+      expect([...idsWhere({ tag: { in: list } }), ...idsWhere({ tag: { notIn: list } })].sort())
+        .toEqual(stored.map((member) => member.id).sort());
+      expect(
+        [...idsWhere({ tag: { in: withNull } }), ...idsWhere({ tag: { notIn: withNull } })].sort(),
+      ).toEqual(stored.map((member) => member.id).sort());
+    }
+
+    // The two decided cases, spelled out rather than left to the sweep's oracle.
+    expect(idsWhere({ tag: { in: [] } })).toEqual([]);
+    expect(idsWhere({ tag: { notIn: [] } })).toEqual(stored.map((member) => member.id));
+    expect(idsWhere({ tag: { in: [null] } })).toEqual(idsWhere({ tag: { eq: null } }));
+    expect(idsWhere({ tag: { notIn: [null] } })).toEqual(idsWhere({ tag: { ne: null } }));
+  });
+
+  test("findByIds still dedupes and preserves the order of first appearance", () => {
+    const { members } = seeded(40);
+    expect(members.findByIds([])).toEqual([]);
+    expect(
+      members.findByIds(["m_7", "m_2", "m_7", "m_999", "m_2", "m_0"]).map((member) => member.id),
+    ).toEqual(["m_7", "m_2", "m_0"]);
+    // The batch size is the axis that used to mint a statement of its own, so the
+    // ordering has to hold at a length no placeholder run would have reached
+    // twice — every id twice, the second copy dropped, the first order kept.
+    const requested = Array.from({ length: 40 }, (_unused, index) => `m_${39 - index}`);
+    expect(members.findByIds([...requested, ...requested]).map((member) => member.id)).toEqual(
+      requested,
+    );
+  });
+
+  test("a list element binds as the value it bound as a placeholder", () => {
+    const store = createStore();
+    const flags = store.collection(
+      "flags",
+      z.object({ id: ref("f"), on: z.boolean().default(false), size: z.number().default(0) }),
+    );
+    flags.insertMany([
+      { id: "f_1", on: true, size: 1 },
+      { id: "f_2", on: false, size: 2.5 },
+      { id: "f_3", on: true, size: 1e21 },
+    ]);
+    // The encoding is the new place a value's type could drift. A JSON boolean is
+    // not what `json_extract` returns for a stored one — it returns the integer
+    // `1`/`0` — so the list carries what `toSqlParameter` already produced, and
+    // an exponent-form number still reads back as the same REAL.
+    expect(flags.find({ where: { on: { in: [true] } }, orderBy: byId }).map((flag) => flag.id))
+      .toEqual(["f_1", "f_3"]);
+    expect(flags.find({ where: { on: { notIn: [true] } } }).map((flag) => flag.id)).toEqual([
+      "f_2",
+    ]);
+    expect(
+      flags.find({ where: { size: { in: [2.5, 1e21] } }, orderBy: byId }).map((flag) => flag.id),
+    ).toEqual(["f_2", "f_3"]);
+    // A string that is a number's decimal spelling must stay a string, or it
+    // would start matching a numeric field it never matched before.
+    expect(flags.find({ where: { size: { in: ["1"] as never } } })).toEqual([]);
+  });
+
+  test("a list past SQLite's parameter ceiling is answerable at all", () => {
+    const { members } = seeded(40);
+    // A statement may carry 65 535 parameters on the SQLite Bun ships — measured,
+    // not assumed — so a placeholder per element refused a longer list outright.
+    // One bound array has no such ceiling, which is a consequence of the shape
+    // rather than its point, and is asserted so it stays true.
+    const PAST_THE_CEILING = 70_000;
+    const ids = Array.from({ length: PAST_THE_CEILING }, (_unused, index) => `m_${index}`);
+    expect(members.findByIds(ids).map((member) => member.id)).toEqual(
+      Array.from({ length: 40 }, (_unused, index) => `m_${index}`),
+    );
+    const tags = Array.from({ length: PAST_THE_CEILING }, (_unused, index) => `t_${index}`);
+    expect(members.count({ tag: { in: tags } })).toBe(
+      members.find({ where: { tag: { isNull: false } } }).length,
+    );
+  });
+
+  test("a list value is data, never SQL, however it is spelled", () => {
+    const { members } = seeded(40);
+    const injection = `t_1", "x'); DROP TABLE "members`;
+    // The list is one bound JSON parameter now rather than a run of placeholders,
+    // so the encoder is the new place a value could have escaped into the text.
+    // It does not: this names no row, and the table is still there afterwards.
+    expect(members.find({ where: { tag: { in: [injection] } } })).toEqual([]);
+    expect(members.findByIds([injection, "m_1"]).map((member) => member.id)).toEqual(["m_1"]);
+    // A value carrying the JSON metacharacters of the encoding itself.
+    expect(members.find({ where: { tag: { in: [`","`, "[]", `\\"`, "t_1"] } } }).length).toBe(
+      members.find({ where: { tag: { eq: "t_1" } } }).length,
+    );
+    expect(members.count({})).toBe(40);
+  });
+
+  test("a non-finite operand keeps the answer it had as a placeholder", () => {
+    const store = createStore();
+    const readings = store.collection(
+      "readings",
+      z.object({ id: ref("r"), level: z.number().nullable().default(null) }),
+    );
+    readings.insertMany([
+      { id: "r_1", level: 1 },
+      { id: "r_2", level: 2 },
+      { id: "r_3", level: null },
+    ]);
+    // `toSqlParameter` passes ±Infinity deliberately, and `JSON.stringify` has no
+    // spelling for it — it emits `null`, and a `null` inside the array a `NOT IN`
+    // reads makes that predicate unknown for every row. So `notIn: [Infinity]`
+    // would have flipped from "every row" to "no row" on a naive encoding.
+    expect(readings.find({ where: { level: { in: [Number.POSITIVE_INFINITY] } } })).toEqual([]);
+    expect(
+      readings
+        .find({ where: { level: { notIn: [Number.POSITIVE_INFINITY] } }, orderBy: byId })
+        .map((reading) => reading.id),
+    ).toEqual(["r_1", "r_2", "r_3"]);
+    expect(
+      readings
+        .find({ where: { level: { in: [Number.NEGATIVE_INFINITY, 2] } }, orderBy: byId })
+        .map((reading) => reading.id),
+    ).toEqual(["r_2"]);
+    expect(
+      readings
+        .find({ where: { level: { notIn: [Number.NEGATIVE_INFINITY, 2] } }, orderBy: byId })
+        .map((reading) => reading.id),
+    ).toEqual(["r_1", "r_3"]);
+    // NaN is still the refusal it was (F046), not a third encoding.
+    expect(() => readings.find({ where: { level: { in: [Number.NaN] } } })).toThrow(
+      /Invalid number operand for operator "in"/,
+    );
+  });
+
+  test("the subquery form still resolves through the id and field indexes", () => {
+    const { store, members } = seeded(2_000);
+    const plan = (sql: string, parameters: SqlParameter[]) =>
+      (
+        store.database.query(`EXPLAIN QUERY PLAN ${sql}`).all(...parameters) as Array<{
+          detail: string;
+        }>
+      )
+        .map((row) => row.detail)
+        .join(" | ");
+
+    // findByIds: the `id` primary key, which is the difference between a lookup
+    // and a table scan over every row in the collection.
+    expect(
+      plan(`SELECT id, doc FROM "members" WHERE ${compileMembership("id", "IN")}`, [
+        encodeMembershipList(["m_1", "m_2"], "test"),
+      ]),
+    ).toMatch(/SEARCH members USING (INDEX sqlite_autoindex_members_1|PRIMARY KEY) \(id=\?\)/);
+
+    // `in` over a declared index on a json_extract expression, which is the
+    // other index this path has to keep usable.
+    const membership = compileWhere({ tag: { in: ["t_1", "t_2"] } });
+    expect(
+      plan(`SELECT id, doc FROM "members" ${membership.sql}`, membership.parameters),
+    ).toMatch(/SEARCH members USING INDEX idx_members_tag \(<expr>=\?\)/);
+
+    // Asserted as a property of this shape rather than assumed: the placeholder
+    // run it replaced resolved the same way, so the plan is not a regression the
+    // suite would otherwise only notice as a slowdown.
+    expect(
+      plan(`SELECT id, doc FROM "members" WHERE id IN (?, ?)`, ["m_1", "m_2"]),
+    ).toMatch(/SEARCH members USING (INDEX sqlite_autoindex_members_1|PRIMARY KEY) \(id=\?\)/);
+    expect(members.findByIds(["m_1", "m_2"]).map((member) => member.id)).toEqual(["m_1", "m_2"]);
+  });
+
+  test("a query per distinct list length retains nothing per length", () => {
+    const { members } = seeded(5);
+    const LIST_COUNT = 2_000;
+    // Ids past the seeded range, so the arms differ in list length and in
+    // nothing else — every call parses the same zero rows through Zod. Every
+    // list the sweep uses is built once and held, before anything is measured:
+    // building 2 000 lists of 2 000 different sizes *inside* a measured arm is
+    // allocator churn that swamps the signal, and it is not what the arms
+    // disagree about.
+    const pool = Array.from({ length: LIST_COUNT }, (_unused, index) => `m_${1_000 + index}`);
+    const lists = Array.from({ length: LIST_COUNT }, (_unused, index) =>
+      pool.slice(0, index + 1),
+    );
+    const residentBytes = () => {
+      Bun.gc(true);
+      return process.memoryUsage().rss;
+    };
+    const measure = (arm: (list: string[]) => void, pick: (index: number) => string[]) => {
+      const before = residentBytes();
+      for (let index = 0; index < LIST_COUNT; index += 1) arm(pick(index));
+      return (residentBytes() - before) / 1024 / 1024;
+    };
+    const throughFind = (list: string[]) => {
+      members.find({ where: { id: { in: list } } });
+    };
+    const throughFindByIds = (list: string[]) => {
+      members.findByIds(list);
+    };
+    const fullLength = lists[LIST_COUNT - 1] as string[];
+
+    // The same warmup discipline F024 records, and for the same reason: RSS
+    // tracks a high-water mark, so an unwarmed first arm charges one-time arena
+    // growth to whichever loop runs first. The warmup is at the *full* length on
+    // purpose — warming over the varying sweep would pre-cache every statement
+    // the defect mints and let a broken build measure as clean.
+    for (let index = 0; index < LIST_COUNT; index += 1) throughFind(fullLength);
+    for (let index = 0; index < LIST_COUNT; index += 1) throughFindByIds(fullLength);
+    // One discarded control pass on top of it. RSS is still shedding the
+    // warmup's garbage when the warmup ends, so a control measured straight
+    // after it reads about -18 MB — a *negative* baseline that silently spends
+    // the slack the varying arms are judged against.
+    measure(throughFind, () => fullLength);
+
+    const fixedArityMegabytes = measure(throughFind, () => fullLength);
+    // `find` before `findByIds`, and the order is load-bearing rather than
+    // arbitrary. RSS is a high-water mark, so whichever varying arm runs first
+    // reports its retention truthfully and the second reports only what it adds
+    // on top — measured the other way round, a `find` that retains 250 MB leaves
+    // the `findByIds` arm reading a negative number on a build where both are
+    // broken. In this order each arm still fails on a regression confined to its
+    // own path: with only `findByIds` reverted, that arm measures ~125 MB while
+    // `find` stays inside the slack.
+    const varyingFindMegabytes = measure(throughFind, (index) => lists[index] as string[]);
+    const varyingFindByIdsMegabytes = measure(
+      throughFindByIds,
+      (index) => lists[index] as string[],
+    );
+
+    // A/B measured over this exact loop with only the membership compilation
+    // swapped. A placeholder per element: ~240 MB on the `find` arm and ~125 MB
+    // on the `findByIds` arm, against a ~0.5 MB control — one statement per
+    // length, never released, and quadratic because each is proportional to its
+    // arity. Bound as one JSON array: ~15 MB and ~2 MB, which is the allocator
+    // churn of encoding 2 000 differently-sized lists rather than retention. The
+    // slack sits between the two, and the comparison is against the control
+    // rather than an absolute ceiling, so a bigger machine cannot pass a leaking
+    // build.
+    expect(varyingFindMegabytes).toBeLessThan(fixedArityMegabytes + 48);
+    expect(varyingFindByIdsMegabytes).toBeLessThan(fixedArityMegabytes + 48);
+  });
+});
+
 // F010 — find() with no limit selected every matching row and parsed each one
 // through Zod into memory, with no ceiling and no warning.
 describe("the find() result ceiling (F010)", () => {
@@ -1985,10 +2318,11 @@ describe("compileWhere — unit", () => {
     expect(() => compileWhere({ name: { contains: null } })).toThrow(
       /Operator "contains" expects a string operand, got null/,
     );
-    // A well-formed list is untouched, empty one included.
+    // A well-formed list is untouched, empty one included. The list binds as one
+    // JSON array parameter rather than a placeholder per element (F027).
     expect(compileWhere({ age: { in: [1, 2] } })).toEqual({
-      sql: "WHERE json_extract(doc, '$.age') IN (?, ?)",
-      parameters: [1, 2],
+      sql: "WHERE json_extract(doc, '$.age') IN (SELECT value FROM json_each(?))",
+      parameters: ["[1,2]"],
     });
     expect(compileWhere({ age: { notIn: [] } })).toEqual({ sql: "WHERE 1", parameters: [] });
   });
@@ -2000,8 +2334,8 @@ describe("compileWhere — unit", () => {
       parameters: ["mine"],
     });
     expect(compileWhere({ nickname: { notIn: ["mine", "yours"] } })).toEqual({
-      sql: `WHERE (${nickname} IS NULL OR ${nickname} NOT IN (?, ?))`,
-      parameters: ["mine", "yours"],
+      sql: `WHERE (${nickname} IS NULL OR ${nickname} NOT IN (${MEMBERSHIP_SOURCE}))`,
+      parameters: [`["mine","yours"]`],
     });
     // The parentheses are load-bearing, because every combinator nests this
     // predicate: `AND` binds tighter than `OR`, so an unparenthesised compound
@@ -2039,12 +2373,12 @@ describe("compileWhere — unit", () => {
     // A mixed list binds only the comparable values; the null is carried by the
     // IS NULL test, because no row equals a bound NULL.
     expect(compileWhere({ nickname: { in: ["mine", null] } })).toEqual({
-      sql: `WHERE (${nickname} IS NULL OR ${nickname} IN (?))`,
-      parameters: ["mine"],
+      sql: `WHERE (${nickname} IS NULL OR ${nickname} IN (${MEMBERSHIP_SOURCE}))`,
+      parameters: [`["mine"]`],
     });
     expect(compileWhere({ nickname: { notIn: ["mine", null] } })).toEqual({
-      sql: `WHERE (${nickname} IS NOT NULL AND ${nickname} NOT IN (?))`,
-      parameters: ["mine"],
+      sql: `WHERE (${nickname} IS NOT NULL AND ${nickname} NOT IN (${MEMBERSHIP_SOURCE}))`,
+      parameters: [`["mine"]`],
     });
     // The empty list still decides without comparing: no rows, every row.
     expect(compileWhere({ nickname: { in: [] } })).toEqual({ sql: "WHERE 0", parameters: [] });
@@ -2136,8 +2470,14 @@ describe("compileWhere — unit", () => {
       ["gte", { sql: `WHERE ${field} >= ?`, parameters: ["x"] }],
       ["lt", { sql: `WHERE ${field} < ?`, parameters: ["x"] }],
       ["lte", { sql: `WHERE ${field} <= ?`, parameters: ["x"] }],
-      ["in", { sql: `WHERE ${field} IN (?)`, parameters: ["x"] }],
-      ["notIn", { sql: `WHERE (${field} IS NULL OR ${field} NOT IN (?))`, parameters: ["x"] }],
+      ["in", { sql: `WHERE ${field} IN (${MEMBERSHIP_SOURCE})`, parameters: [`["x"]`] }],
+      [
+        "notIn",
+        {
+          sql: `WHERE (${field} IS NULL OR ${field} NOT IN (${MEMBERSHIP_SOURCE}))`,
+          parameters: [`["x"]`],
+        },
+      ],
       ["like", { sql: `WHERE ${field} LIKE ? ESCAPE '\\'`, parameters: ["x"] }],
       ["contains", { sql: `WHERE ${field} LIKE ? ESCAPE '\\'`, parameters: ["%x%"] }],
       ["startsWith", { sql: `WHERE ${field} LIKE ? ESCAPE '\\'`, parameters: ["x%"] }],
