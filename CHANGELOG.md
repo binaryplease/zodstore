@@ -36,6 +36,13 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
   index. A single field with neither a `.` nor a `_` — `["status"]` — is spelled
   exactly as before.
 
+  An index name is scoped to the *database*, not to the table it is on, so two
+  collections can still derive onto one name — a collection called `t_a_` with a
+  field `b`, and one called `t` with a field `a_b`. That is the same silent no-op
+  one table wider, and it is now **refused loudly** by the same rule: the open
+  checks the whole catalogue for the name it derives, not just its own table's
+  indexes, and names the table already holding it.
+
 - **A redefinition of an index is now refused loudly instead of ignored.** The
   same silent no-op also covered a genuine change of mind: the same fields
   declared once non-unique and once unique. `unique` is deliberately not part of
@@ -86,9 +93,13 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
   Every option is now validated and resolved in one step upstream of the open,
   which never sees the raw options: the ordering the comment at that binding
   asserts holds structurally rather than by line order, so an option added later
-  is unreachable until it is validated there too. The F013 guard is unchanged —
-  two *successful* opens with conflicting `idField`s are still refused, including
-  the case-variant spelling.
+  is unreachable until it is validated there too. The binding itself is now
+  *checked* before the first statement and *recorded* after the last one, so a
+  statement that throws leaves nothing behind either — `CREATE UNIQUE INDEX`
+  failing against rows a previous run stored used to poison the connection in
+  exactly the way a bad option did. The F013 guard is unchanged — two
+  *successful* opens with conflicting `idField`s are still refused, including the
+  case-variant spelling.
 
 - **An `in`/`notIn` list no longer retains a prepared statement per distinct
   length.** The element *count* was part of the SQL text — `in` over three values

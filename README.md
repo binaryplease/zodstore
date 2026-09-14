@@ -275,7 +275,10 @@ An index is named after its field list alone — `idx_<table>_<fields>`, with a 
 `_` doubled, a `.` written `_dot_` and `_and_` between two fields, so no two field lists
 can produce one name. `["status"]` is `idx_notes_status`; `["address.city"]` is
 `idx_places_address_dot_city`. The name is a pure function of the fields, so reopening a
-collection with a declaration it already carries creates nothing.
+collection with a declaration it already carries creates nothing. An index name is
+scoped to the database rather than to one table, so on the rare shapes where two
+collections derive onto the same name the open throws instead of quietly creating
+nothing.
 
 `unique` is deliberately not part of the name, so declaring the same fields once
 non-unique and once unique is a **redefinition, and it throws**:

@@ -153,6 +153,13 @@ function readListOperand(operator: string, operand: unknown): readonly unknown[]
  * path is validated against a strict identifier pattern so it can be embedded in
  * the SQL string without opening an injection vector — values always travel as
  * bound parameters, never field names.
+ *
+ * The text this returns is load-bearing beyond the statement it lands in: an
+ * expression index stores it verbatim in `sqlite_master`, and reopening a
+ * collection compares this output against what an existing file already holds
+ * (`resolveIndexes` in `src/collection.ts`). Whitespace is normalised on both
+ * sides of that compare, but changing the expression's shape changes what every
+ * stored index says it is.
  */
 export function jsonExtract(fieldPath: string): string {
   if (!FIELD_PATH_PATTERN.test(fieldPath)) {

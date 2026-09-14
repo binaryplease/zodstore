@@ -2267,6 +2267,41 @@ describe("collection reopen bindings (F013)", () => {
       store.collection("T", z.object({ userId: z.string() }), { idField: "userId" }),
     ).toThrow(/collection\("T" \(same table as "t"\)\): already open with idField "id"/);
   });
+
+  // The other half of F045: an option can be valid and its *statement* still
+  // throw — `CREATE UNIQUE INDEX` does, against rows a previous run already
+  // stored. The binding is therefore recorded at the end of a successful open
+  // rather than before the statements, so a failed open is as absent as a
+  // refused one.
+  test("a statement that throws leaves no binding either (F045)", () => {
+    const Users = z.object({ userId: z.string(), email: z.string().default("") });
+    withTemporaryDirectory((databasePath) => {
+      // A previous run, before anyone declared the constraint: two rows that
+      // share an email. It has to be a separate connection, or the binding under
+      // test would be the one that run legitimately recorded.
+      const before = createStore({ path: databasePath });
+      const users = before.collection("t", Users, { idField: "userId" });
+      users.insert({ userId: "u_1", email: "same@example.com" });
+      users.insert({ userId: "u_2", email: "same@example.com" });
+      before.close();
+
+      const after = createStore({ path: databasePath });
+      expect(() =>
+        after.collection("t", Users, {
+          idField: "userId",
+          indexes: [{ fields: ["email"], unique: true }],
+        }),
+      ).toThrow(/UNIQUE constraint failed/);
+      // The open failed, so nothing is open under "userId" — the corrected call
+      // is not refused against an identity convention no open established.
+      const retried = after.collection(
+        "t",
+        z.object({ id: z.string(), email: z.string().default("") }),
+      );
+      expect(retried.idField).toBe("id");
+      after.close();
+    });
+  });
 });
 
 // F043 — the index name replaced every dot with an underscore, so `a.b` and
@@ -2446,6 +2481,50 @@ describe("index names and redefinition (F043)", () => {
     expect(() =>
       store.collection("things", CollidingSchema, { indexes: ["a_b"] }),
     ).toThrow(/an index named "idx_things_a__b" already exists on this table over a different expression/);
+  });
+
+  // An index name is scoped to the database, not to the table it is on, so two
+  // collections can derive onto one name — `t_a_` with field `b` and `t` with
+  // field `a_b` both reach `idx_t_a__b`. Creating under a taken name is the same
+  // silent no-op F043 is about, and the open must not then drop the superseded
+  // index whose replacement was never created.
+  test("a name another table's index holds is refused, and drops nothing", () => {
+    const CrossSchema = z.object({
+      id: z.string(),
+      b: z.string().default(""),
+      a_b: z.string().default(""),
+    });
+    const store = createStore();
+    store.collection("t_a_", CrossSchema, { indexes: ["b"] });
+    expect(userIndexes(store, "t_a_").map((index) => index.name)).toEqual(["idx_t_a__b"]);
+
+    // A file written up to 0.4.2: table `t`, a UNIQUE index under the old name.
+    store.database.run(
+      `CREATE TABLE IF NOT EXISTS "main"."t" (id TEXT PRIMARY KEY, doc TEXT NOT NULL)`,
+    );
+    store.database.run(
+      `CREATE UNIQUE INDEX "main"."idx_t_a_b" ON "t" (json_extract(doc, '$.a_b'))`,
+    );
+    expect(() =>
+      store.collection("t", CrossSchema, { indexes: [{ fields: ["a_b"], unique: true }] }),
+    ).toThrow(
+      /the index name "idx_t_a__b" derived for \(a_b\) is already taken by an index on table "t_a_"/,
+    );
+
+    // The constraint that was there before the call is still there after it: the
+    // superseded index was not dropped against a replacement that never existed.
+    expect(userIndexes(store, "t").map((index) => index.name)).toEqual(["idx_t_a_b"]);
+    const things = store.collection("t", CrossSchema);
+    things.insert({ id: "t1", a_b: "dup" });
+    expect(() => things.insert({ id: "t2", a_b: "dup" })).toThrow(/UNIQUE constraint failed/);
+
+    // And with no superseded index in the picture, the collision is still a
+    // refusal rather than an index that silently never appears.
+    const plain = createStore();
+    plain.collection("t_a_", CrossSchema, { indexes: ["b"] });
+    expect(() =>
+      plain.collection("t", CrossSchema, { indexes: [{ fields: ["a_b"], unique: true }] }),
+    ).toThrow(/already taken by an index on table "t_a_"/);
   });
 });
 

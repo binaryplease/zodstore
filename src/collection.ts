@@ -297,32 +297,36 @@ export interface TableBinding {
 const TABLE_BINDINGS = new WeakMap<Database, Map<string, TableBinding>>();
 
 /**
- * Record what a table is open with, refusing a reopen that conflicts. Only
+ * The registry key for one table. Case-insensitive, because SQLite identifiers
+ * are: `CREATE TABLE IF NOT EXISTS "KS"` resolves to an existing `ks`, so a
+ * case-variant name is one table to the database and must be one binding here
+ * too. The key carries the database name as well, because a connection inside a
+ * cross-store transaction holds several files at once and `main.orders` is not
+ * the same table as `store_1.orders`.
+ */
+function tableBindingKey(databaseName: string, name: string): string {
+  return `${databaseName.toLowerCase()}.${name.toLowerCase()}`;
+}
+
+/**
+ * Refuse a reopen that conflicts with what a table is already open with. Only
  * `idField` is pinned: reopening with an *extended* schema is the supported
  * forward-compatibility path, while identity changing under a table
  * is never intentional — it writes rows under two incompatible conventions and
  * surfaces far away, as a row neither handle can read.
  *
- * Keyed case-insensitively, because SQLite identifiers are: `CREATE TABLE IF
- * NOT EXISTS "KS"` resolves to an existing `ks`, so a case-variant name is one
- * table to the database and must be one binding here too. The key carries the
- * database name as well, because a connection inside a cross-store transaction
- * holds several files at once and `main.orders` is not the same table
- * as `store_1.orders`.
+ * Checking is separate from recording so an open can do the two at its two ends:
+ * the conflict is refused before the first statement runs, and the binding is
+ * recorded only once every statement has succeeded. A call that throws in
+ * between leaves no binding behind for the next one to collide with (F045, #8).
  */
-function bindTable(
+function assertTableBinding(
   database: Database,
   databaseName: string,
   name: string,
   idField: string,
 ): void {
-  let bindings = TABLE_BINDINGS.get(database);
-  if (bindings === undefined) {
-    bindings = new Map();
-    TABLE_BINDINGS.set(database, bindings);
-  }
-  const key = `${databaseName.toLowerCase()}.${name.toLowerCase()}`;
-  const existing = bindings.get(key);
+  const existing = TABLE_BINDINGS.get(database)?.get(tableBindingKey(databaseName, name));
   if (existing !== undefined && existing.idField !== idField) {
     // Name both spellings: with a case-variant reopen the caller is looking at
     // a name they believe is new, and "already open" is only actionable if it
@@ -335,7 +339,33 @@ function bindTable(
         `reopening with an extended schema is supported, changing the id field is not.`,
     );
   }
-  if (existing === undefined) bindings.set(key, { idField, openedAs: name });
+}
+
+/** Record what a table is open with. The first open of a table wins. */
+function recordTableBinding(
+  database: Database,
+  databaseName: string,
+  name: string,
+  idField: string,
+): void {
+  let bindings = TABLE_BINDINGS.get(database);
+  if (bindings === undefined) {
+    bindings = new Map();
+    TABLE_BINDINGS.set(database, bindings);
+  }
+  const key = tableBindingKey(databaseName, name);
+  if (!bindings.has(key)) bindings.set(key, { idField, openedAs: name });
+}
+
+/** Check and record in one step, for a caller that runs no statements between. */
+function bindTable(
+  database: Database,
+  databaseName: string,
+  name: string,
+  idField: string,
+): void {
+  assertTableBinding(database, databaseName, name, idField);
+  recordTableBinding(database, databaseName, name, idField);
 }
 
 /**
@@ -426,8 +456,10 @@ function supersededIndexName(tableName: string, fields: readonly string[]): stri
   return `idx_${tableName}_${suffix}`;
 }
 
-/** An index already on the table, as far as its stored `CREATE` text says. */
+/** An index already in the database, as far as its stored `CREATE` text says. */
 interface ExistingIndex {
+  /** The table it is on. An index name is database-wide; an index is not. */
+  readonly tableName: string;
   readonly unique: boolean;
   /**
    * The parenthesised expression list it indexes, or `null` for a `CREATE`
@@ -437,13 +469,24 @@ interface ExistingIndex {
 }
 
 /**
- * Split a stored `CREATE INDEX` back into the two things a declaration is
- * compared against. SQLite keeps the statement text verbatim apart from
- * dropping `IF NOT EXISTS` and the database qualifier, and every index this
- * library writes ends in its expression list, so the comparison is against text
- * this same function generated.
+ * Split a stored `CREATE INDEX` back into the things a declaration is compared
+ * against. SQLite keeps the statement text verbatim apart from dropping `IF NOT
+ * EXISTS` and the database qualifier, and every index this library writes ends
+ * in its expression list, so the comparison is against text this same module
+ * generated.
+ *
+ * That makes `jsonExtract`'s exact output load-bearing across versions: it is
+ * what sits in `sqlite_master` in an existing file, and a reopen compares
+ * against it. Whitespace is normalised on both sides below so spacing alone
+ * cannot turn a reopen into a refusal, but a deeper change to that expression's
+ * shape is a change to what every stored index says it is.
  */
 const CREATE_INDEX_PATTERN = /^CREATE\s+(UNIQUE\s+)?INDEX\b[\s\S]*?\(([\s\S]*)\)\s*;?\s*$/i;
+
+/** Compare two expression lists as SQL rather than as text. */
+function normalizeExpressions(expressions: string): string {
+  return expressions.replace(/\s+/g, " ").trim();
+}
 
 /**
  * One index declaration, resolved against what the table already carries:
@@ -461,31 +504,44 @@ interface ResolvedIndex {
   readonly supersedes: string | null;
 }
 
-/** Every index currently on one table, keyed by name. */
+/**
+ * Every index in one database, keyed by name.
+ *
+ * Read across the whole database rather than one table, because that is the
+ * scope an index name lives in: `CREATE INDEX IF NOT EXISTS` on a name another
+ * *table* already holds is a silent no-op, which is the same defect F043 (#6)
+ * is about one table wider — and a plan drawn from a per-table read would then
+ * drop a superseded index whose replacement was never created.
+ */
 function readExistingIndexes(
   database: Database,
   databaseName: string,
-  tableName: string,
 ): Map<string, ExistingIndex> {
-  // The table name travels as a bound value, not as an identifier: this reads
-  // the catalogue rather than the table, so nothing about it has to reach the
-  // SQL text. `sql IS NULL` is an index SQLite made itself (the primary key's),
-  // which no declaration can collide with.
+  // Nothing here reaches the SQL text but the generated database name: this
+  // reads the catalogue rather than any table. `sql IS NULL` is an index SQLite
+  // made itself (the primary key's), which no declaration can collide with,
+  // because a derived name always carries the `idx_` prefix.
   const rows = database
     .query(
-      `SELECT name, sql FROM "${databaseName}".sqlite_master ` +
-        `WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL`,
+      `SELECT name, tbl_name, sql FROM "${databaseName}".sqlite_master ` +
+        `WHERE type = 'index' AND sql IS NOT NULL`,
     )
-    .all(tableName) as Array<{ name: string; sql: string }>;
+    .all() as Array<{ name: string; tbl_name: string; sql: string }>;
   const existing = new Map<string, ExistingIndex>();
   for (const row of rows) {
     const parsed = CREATE_INDEX_PATTERN.exec(row.sql);
     existing.set(row.name, {
+      tableName: row.tbl_name,
       unique: parsed !== null && parsed[1] !== undefined,
-      expressions: parsed?.[2] ?? null,
+      expressions: parsed?.[2] === undefined ? null : normalizeExpressions(parsed[2]),
     });
   }
   return existing;
+}
+
+/** SQLite table names are case-insensitive, so two spellings are one table. */
+function isSameTable(one: string, other: string): boolean {
+  return one.toLowerCase() === other.toLowerCase();
 }
 
 function describeUniqueness(unique: boolean): string {
@@ -519,10 +575,30 @@ function refuseIndexRedefinition(
 }
 
 /**
- * Validate every index declaration and resolve it against the table's current
- * indexes. Reads the catalogue, writes nothing and records nothing: every throw
- * a bad or conflicting declaration causes happens here, above `bindTable` and
- * above the first statement of the open (F045, #8).
+ * Refuse a derived name that another table's index already holds. An index name
+ * is database-wide, so this is a real collision: creating under it would be the
+ * silent no-op F043 (#6) is about, and the index that answers to the name
+ * belongs to somebody else's table.
+ */
+function refuseForeignIndexName(
+  collectionName: string,
+  derivedName: string,
+  ownerTable: string,
+  fields: readonly string[],
+): never {
+  throw new Error(
+    `collection("${collectionName}"): the index name "${derivedName}" derived for ` +
+      `(${fields.join(", ")}) is already taken by an index on table "${ownerTable}". ` +
+      `An index name is database-wide, so the two cannot both exist: rename that index, ` +
+      `or the collection whose name derives onto it, and reopen.`,
+  );
+}
+
+/**
+ * Validate every index declaration and resolve it against the indexes the
+ * database already holds. Reads the catalogue, writes nothing and records
+ * nothing: every throw a bad or conflicting declaration causes happens here,
+ * above the binding and above the first statement of the open (F045, #8).
  */
 function resolveIndexes(
   database: Database,
@@ -531,7 +607,7 @@ function resolveIndexes(
   declarations: readonly IndexInput[],
 ): ResolvedIndex[] {
   if (declarations.length === 0) return [];
-  const existing = readExistingIndexes(database, databaseName, tableName);
+  const existing = readExistingIndexes(database, databaseName);
   const resolved = new Map<string, ResolvedIndex>();
   for (const declaration of declarations) {
     const { fields, unique = false } = normalizeIndex(declaration);
@@ -542,7 +618,7 @@ function resolveIndexes(
       );
     }
     // Path-checked first, so the name below is derived from validated paths.
-    const expressions = fields.map((field) => jsonExtract(field)).join(", ");
+    const expressions = normalizeExpressions(fields.map((field) => jsonExtract(field)).join(", "));
     const name = indexName(tableName, fields);
 
     const declaredTwice = resolved.get(name);
@@ -559,6 +635,9 @@ function resolveIndexes(
 
     const current = existing.get(name);
     if (current !== undefined) {
+      if (!isSameTable(current.tableName, tableName)) {
+        refuseForeignIndexName(tableName, name, current.tableName, fields);
+      }
       if (current.expressions !== expressions) {
         throw new Error(
           `collection("${tableName}"): an index named "${name}" already exists on this ` +
@@ -575,10 +654,14 @@ function resolveIndexes(
     // An index this declaration wrote under the superseded name is the same
     // index: same expression list, same table. Adopt it — the open creates the
     // one under the injective name and drops that one — rather than leaving the
-    // file carrying two indexes over one expression.
+    // file carrying two indexes over one expression. An index of that name on
+    // another table is not this declaration's and is never dropped.
     const supersededName = supersededIndexName(tableName, fields);
     const superseded = supersededName === name ? undefined : existing.get(supersededName);
-    const supersedesThis = superseded !== undefined && superseded.expressions === expressions;
+    const supersedesThis =
+      superseded !== undefined &&
+      isSameTable(superseded.tableName, tableName) &&
+      superseded.expressions === expressions;
     if (supersedesThis && superseded.unique !== unique) {
       refuseIndexRedefinition(
         tableName,
@@ -595,6 +678,9 @@ function resolveIndexes(
       fields,
       unique,
       expressions,
+      // The name is free database-wide when nothing holds it, so the `CREATE`
+      // below cannot be a no-op — which is what makes the `DROP` that follows
+      // it safe: the replacement is on this table before the superseded one goes.
       create: current === undefined,
       supersedes: supersedesThis ? supersededName : null,
     });
@@ -1121,12 +1207,11 @@ function openResolvedCollection<TSchema extends z.ZodType>(
   type TDocument = z.output<TSchema>;
 
   const { idField, maxRows, onParseError } = resolvedOptions;
-  // Every option is validated before the first statement runs, so a bad one
-  // never leaves a table behind — and the reopen conflict is refused before it
-  // can add an index or a row under the wrong identity convention. The
-  // validation is `resolveCollectionOptions`, upstream of this function, so the
-  // guarantee is structural: nothing reachable from here can throw on an option.
-  bindTable(database, databaseName, name, idField);
+  // Every option is validated before the first statement runs, in
+  // `resolveCollectionOptions` upstream of this function — so a bad one never
+  // leaves a table behind — and the reopen conflict is refused here, before the
+  // open can add an index or a row under the wrong identity convention.
+  assertTableBinding(database, databaseName, name, idField);
 
   const quotedTable = `"${databaseName}"."${name}"`;
 
@@ -1152,6 +1237,13 @@ function openResolvedCollection<TSchema extends z.ZodType>(
       database.run(`DROP INDEX IF EXISTS "${databaseName}"."${index.supersedes}"`);
     }
   }
+
+  // Recorded last, once every statement of this open has succeeded. A call that
+  // threw — on an option above, or on a statement here, as `CREATE UNIQUE INDEX`
+  // does against stored duplicates — leaves no binding for the next call to
+  // collide with, which is the whole of F045 (#8): the table is open under this
+  // identity convention, or it was never opened at all.
+  recordTableBinding(database, databaseName, name, idField);
 
   // Cached statements — bun:sqlite reuses the underlying prepared statement.
   const insertStatement = database.query(
