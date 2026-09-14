@@ -13,6 +13,50 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
 
 ### Fixed
 
+- **The declared-default guard now walks a schema all the way down.** It read one
+  shape and stopped, so a member nested inside a defaulted object was never asked
+  for a default of its own — and a parent's `.default(…)` does not cover it: a row
+  that already stores the object is parsed against every member of it (F048,
+  [#11](https://github.com/binaryplease/zodstore/issues/11)):
+
+  ```ts
+  // v1 wrote: { id: "s_old", settings: { theme: "light" } }
+  store.collection("s", z.object({
+    id: ref("s"),
+    settings: z.object({ theme: z.string().default("light"), fontSize: z.number() })
+               .default({ theme: "light", fontSize: 14 }),
+  }));
+  // was accepted — and then every row written before the extension failed to read
+  // now throws: field "settings.fontSize" has no default …
+  ```
+
+  The guard's reach is the guarantee's reach, so a walk that stopped at depth one
+  promised forward-readability for flat documents only. It arrived loudly (on the
+  default `onParseError: "throw"`) but at the wrong time: on the first read of an
+  old row, in a deployed system, against one customer's file — instead of at
+  `store.collection(...)`, in the developer's own process, seconds after the
+  schema was written. No fixture could have caught it, because every test row is
+  written under the current schema.
+
+  The walk now recurses into every declared field and into what a container
+  *stores* — an array's elements, a tuple's positions, a record's values — and
+  names the full path (`settings.fontSize`, `tags[].color`, `prefs.<key>.size`)
+  rather than the leaf. A `ref()` stays exempt at any depth; `idField` exempts
+  only at the top level, because that name is the column the rows are keyed by, so
+  a nested `id` is an ordinary field. A nested union or intersection is refused
+  naming the field, on the same terms a top-level one already was. Where the walk
+  stops is decided and written down in `README.md` rather than left in a test
+  comment: at a shape already walked (which is what terminates a self-referential
+  schema), at the contents of a `z.map()` or `z.set()` (neither survives the write
+  gate's JSON round-trip, so no such field reaches storage at all), and at ten
+  levels of nesting, which is refused rather than skipped.
+
+  This **refuses schemas that opened cleanly before**: a nested optional without a
+  default now throws at `store.collection(...)`. That is the point — the row it
+  would have stranded is the one already on disk — but expect a batch of them on
+  upgrade. Fix them at the schema, or pass `{ enforceDefaults: false }` to stage
+  the change, as the top-level rule has always allowed.
+
 - **Both collection guards now see through the wrappers around a schema.**
   `assertNoReservedFieldNames` and `assertDefaultsDeclared` each read
   `schema.shape` and treated an absent `.shape` as "nothing to enforce". That is

@@ -7,7 +7,9 @@ import type { z } from "zod";
  * `createCollection` enforces two rules where a schema is declared — no field
  * may shadow a where-clause combinator, and every non-identity field must carry
  * a `.default(...)` — and both rest on one question: which fields does this
- * schema declare? Each guard used to answer it by reading `schema.shape` and
+ * schema declare? (The defaults rule asks it recursively, so this module also
+ * answers the neighbouring one: what does a container declare its stored
+ * *members* under — see `readContainedSchemas`.) Each guard used to answer it by reading `schema.shape` and
  * treating an absent `.shape` as "nothing to enforce". That is true of
  * `z.string()`; it is not true of `z.object({…}).transform(…)`, `.pipe()` or a
  * union, which have fields and no `.shape`, so both guards silently did nothing
@@ -64,6 +66,12 @@ interface SchemaDefinition {
   /** The halves of an intersection. */
   left?: unknown;
   right?: unknown;
+  /** The element schema of Zod 4's `ZodArray` — Zod 3 keeps it under `type`. */
+  element?: unknown;
+  /** The value schema of a record, on both majors. */
+  valueType?: unknown;
+  /** The positional member schemas of a tuple, on both majors. */
+  items?: unknown;
 }
 
 /** A schema's definition object, or `undefined` for anything that is not one. */
@@ -162,6 +170,74 @@ export function readObjectShape(schema: unknown, depth = 0): SchemaShape {
   const inner = innerDeclaredSchema(schema);
   if (inner === undefined) return { kind: "none" };
   return readObjectShape(inner, depth + 1);
+}
+
+/**
+ * One schema that a *stored member* of a container is parsed against, and how
+ * that member is named in a field path.
+ *
+ * A container declares no fields of its own — `readObjectShape` answers `"none"`
+ * for an array, a record and a tuple — but what it stores is parsed against a
+ * declared schema all the same, so a rule about "what an already-stored value is
+ * parsed against" reaches through it. The `kind` is what the caller renders the
+ * path segment from; the reader does not spell paths.
+ */
+export interface ContainedSchema {
+  /** `element` for an array member, `item` for a tuple position, `value` for a record's values. */
+  kind: "element" | "item" | "value";
+  /** The tuple position, and `null` for the kinds that have none. */
+  position: number | null;
+  schema: unknown;
+}
+
+/**
+ * Zod 4 tags a schema's kind with a string under `type`; Zod 3 with a type name
+ * under `typeName`. Zod 3's `ZodArray` also uses `type` — for its *element
+ * schema* — so the string check is what keeps the two readings apart.
+ */
+function schemaTag(definition: SchemaDefinition): string | undefined {
+  if (typeof definition.type === "string") return definition.type;
+  return typeof definition.typeName === "string" ? definition.typeName : undefined;
+}
+
+/**
+ * The schemas a container stores its members under, through whatever wrappers
+ * the container carries (`z.array(…).default([])`), or `[]` for anything that is
+ * not a container this library can read into.
+ *
+ * `z.map()` and `z.set()` are deliberately **not** read: neither survives the
+ * JSON round-trip the write gate enforces, so no such field can reach storage in
+ * the first place and there is no stored member to hold to a rule.
+ */
+export function readContainedSchemas(schema: unknown, depth = 0): ContainedSchema[] {
+  if (depth >= MAX_WRAPPER_DEPTH) return [];
+
+  const definition = readDefinition(schema);
+  if (definition === undefined) return [];
+
+  switch (schemaTag(definition)) {
+    case "array":
+    case "ZodArray": {
+      // Zod 4 keeps the element under `element`, Zod 3 under `type`.
+      const element = definition.element ?? definition.type;
+      return element === undefined ? [] : [{ kind: "element", position: null, schema: element }];
+    }
+    case "record":
+    case "ZodRecord": {
+      const value = definition.valueType;
+      return value === undefined ? [] : [{ kind: "value", position: null, schema: value }];
+    }
+    case "tuple":
+    case "ZodTuple": {
+      const items = Array.isArray(definition.items) ? definition.items : [];
+      return items.map((item, position) => ({ kind: "item" as const, position, schema: item }));
+    }
+    default:
+      break;
+  }
+
+  const inner = innerDeclaredSchema(schema);
+  return inner === undefined ? [] : readContainedSchemas(inner, depth + 1);
 }
 
 /**

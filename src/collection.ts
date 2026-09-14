@@ -9,8 +9,10 @@ import {
 } from "./query.ts";
 import { isReference } from "./ref.ts";
 import {
+  type ContainedSchema,
   hasDeclaredDefault,
   MAX_WRAPPER_DEPTH,
+  readContainedSchemas,
   readDeclaredFieldNames,
   readObjectShape,
 } from "./schema-shape.ts";
@@ -605,6 +607,39 @@ function describeIssues(issues: readonly ReportableIssue[], schema: unknown): st
 }
 
 /**
+ * How many levels of nesting the declared-default walk descends before it
+ * refuses. The walk already terminates on a schema that reaches itself — a shape
+ * it has walked is not walked again — but `z.lazy()` may hand back a *fresh*
+ * schema on every call, which no identity check can catch. Past this bound the
+ * rule is refused rather than skipped, for the same reason an unreadable shape
+ * is: enforcing nothing is a rule reporting a check it never ran. No document a
+ * person writes nests anywhere near this deep.
+ */
+const MAX_NESTING_DEPTH = 10;
+
+/** What one descent of the declared-default walk carries with it. */
+interface DefaultsWalk {
+  readonly collectionName: string;
+  readonly idField: string;
+  /**
+   * Shapes already walked, so a self-referential schema terminates. It is a memo
+   * as much as a cycle guard: a shape's members answer the same way wherever the
+   * shape is reached from. The **collection's own** shape is deliberately not
+   * recorded, because it is the one shape walked under the `idField` exemption —
+   * a self-referential document is therefore walked once more, one level in,
+   * where a member named like the id field is held to the rule like any other.
+   */
+  readonly walkedShapes: Set<object>;
+}
+
+/** How a contained member extends the path of the container that holds it. */
+function containedPath(path: string, contained: ContainedSchema): string {
+  if (contained.kind === "value") return path === "" ? ELIDED_KEY : `${path}.${ELIDED_KEY}`;
+  if (contained.kind === "item") return `${path}[${contained.position}]`;
+  return `${path}[]`;
+}
+
+/**
  * Enforce the default rule at collection creation: every non-identity field of
  * an object schema declares a default, so old rows read forward under an extended
  * schema and no field is silently dropped from storage. This library is the
@@ -622,37 +657,113 @@ function describeIssues(issues: readonly ReportableIssue[], schema: unknown): st
  * rule that reports a check it never performed. `{ enforceDefaults: false }` is
  * the way past it, which makes the exception a caller's decision rather than an
  * accident of how the schema was spelled.
+ *
+ * The walk **recurses** (F048, #11). It used to read one shape and stop, so a
+ * member nested inside a defaulted object was never asked for a default of its
+ * own — and a parent's `.default(…)` does not cover it: a stored row that
+ * already holds the object is parsed against every member of it, so adding one
+ * defaultless member made every row written before the extension unreadable,
+ * loudly, on the first read of an old row rather than here. Where the recursion
+ * goes, and where it stops, is `assertSchemaDefaults` below.
  */
 function assertDefaultsDeclared(
   schema: z.ZodType,
   collectionName: string,
   idField: string,
 ): void {
+  assertSchemaDefaults(schema, "", { collectionName, idField, walkedShapes: new Set() }, 0);
+}
+
+/**
+ * One step of the declared-default walk: hold every member a schema declares to
+ * the rule, then descend into whatever those members declare in turn. `path` is
+ * the dotted field path this schema sits at, and `""` is the collection's own
+ * schema.
+ *
+ * **Where it descends.** Into every declared field, and into what a container
+ * stores — an array's elements, a tuple's positions, a record's values — because
+ * each of those is a schema an *already-stored* value is parsed against, which
+ * is the whole of what the rule is about. The wrappers around either are
+ * followed by the readers in `schema-shape.ts`, so `.default()`, `.transform()`
+ * and `z.lazy()` do not hide a shape from the walk.
+ *
+ * **What is exempt.** `isReference` at any depth: a foreign key is
+ * identity-shaped wherever it sits. `idField` **only at the top level**, because
+ * it names the column this collection keys its rows by — a nested member that
+ * happens to share the name is an ordinary field and is held to the rule.
+ *
+ * **Where it stops.** At a shape it has already walked, which terminates a
+ * self-referential schema; at `MAX_NESTING_DEPTH`, which terminates a `z.lazy()`
+ * that builds a new schema per call; at a shape it cannot read as one shape (a
+ * union, an intersection), which it refuses rather than skips, exactly as it
+ * does for the collection's own schema; and at `z.map()` / `z.set()`, which are
+ * skipped on purpose because neither survives the write gate's JSON round-trip,
+ * so no such field ever reaches storage to be read forward.
+ */
+function assertSchemaDefaults(
+  schema: unknown,
+  path: string,
+  walk: DefaultsWalk,
+  depth: number,
+): void {
+  if (depth > MAX_NESTING_DEPTH) {
+    throw new Error(
+      `Collection "${walk.collectionName}": field "${path}" nests more than ` +
+        `${MAX_NESTING_DEPTH} levels deep, so the declared-default rule cannot be ` +
+        `enforced past it. Flatten the schema, or pass { enforceDefaults: false } to ` +
+        `take the schema's fields on yourself.`,
+    );
+  }
+
   const reading = readObjectShape(schema);
   if (reading.kind === "opaque") {
     throw new Error(
-      `Collection "${collectionName}": the schema's fields cannot be read as one ` +
-        `shape, so the declared-default rule cannot be enforced on it — a union or an ` +
-        `intersection of object schemas declares fields, but not as one shape. Give the ` +
-        `collection a single object schema (the wrappers around one — .transform(), ` +
-        `.pipe(), .brand(), .default() — are followed), or pass ` +
-        `{ enforceDefaults: false } to take the schema's fields on yourself.`,
+      path === ""
+        ? `Collection "${walk.collectionName}": the schema's fields cannot be read as one ` +
+          `shape, so the declared-default rule cannot be enforced on it — a union or an ` +
+          `intersection of object schemas declares fields, but not as one shape. Give the ` +
+          `collection a single object schema (the wrappers around one — .transform(), ` +
+          `.pipe(), .brand(), .default() — are followed), or pass ` +
+          `{ enforceDefaults: false } to take the schema's fields on yourself.`
+        : `Collection "${walk.collectionName}": field "${path}" declares fields that cannot ` +
+          `be read as one shape, so the declared-default rule cannot be enforced on them — ` +
+          `a union or an intersection of object schemas declares fields, but not as one ` +
+          `shape. Give the field a single object schema (the wrappers around one — ` +
+          `.transform(), .pipe(), .brand(), .default() — are followed), or pass ` +
+          `{ enforceDefaults: false } to take the schema's fields on yourself.`,
     );
   }
-  // A schema that declares no fields at all has nothing to enforce.
-  if (reading.kind === "none") return;
+
+  // A schema that declares no fields of its own may still *store* documents —
+  // an array of objects, a record of them — and a stored member is parsed
+  // against its schema exactly as a stored field is.
+  if (reading.kind === "none") {
+    for (const contained of readContainedSchemas(schema)) {
+      assertSchemaDefaults(contained.schema, containedPath(path, contained), walk, depth + 1);
+    }
+    return;
+  }
+
+  if (walk.walkedShapes.has(reading.shape)) return;
+  if (path !== "") walk.walkedShapes.add(reading.shape);
 
   for (const [fieldName, fieldSchema] of Object.entries(reading.shape)) {
-    if (fieldName === idField || isReference(fieldSchema)) continue;
-    if (hasDeclaredDefault(fieldSchema)) continue;
-    throw new Error(
-      `Collection "${collectionName}": field "${fieldName}" has no default. Every ` +
-        `non-identity field must declare .default(...) so old rows read forward under ` +
-        `an extended schema, or the field is dropped from storage entirely. Identity ` +
-        `fields are the documented exception — the id field, and a ref() foreign key ` +
-        `whether or not it is wrapped in .nullable(), .optional() or .describe(); pass ` +
-        `{ enforceDefaults: false } to opt out.`,
-    );
+    if (path === "" && fieldName === walk.idField) continue;
+    if (isReference(fieldSchema)) continue;
+    const fieldPath = path === "" ? fieldName : `${path}.${fieldName}`;
+    if (!hasDeclaredDefault(fieldSchema)) {
+      throw new Error(
+        `Collection "${walk.collectionName}": field "${fieldPath}" has no default. Every ` +
+          `non-identity field must declare .default(...) so old rows read forward under ` +
+          `an extended schema, or the field is dropped from storage entirely. A default on ` +
+          `an enclosing object does not cover its members: a row that already stores the ` +
+          `object is parsed against every one of them. Identity ` +
+          `fields are the documented exception — the id field, and a ref() foreign key ` +
+          `whether or not it is wrapped in .nullable(), .optional() or .describe(); pass ` +
+          `{ enforceDefaults: false } to opt out.`,
+      );
+    }
+    assertSchemaDefaults(fieldSchema, fieldPath, walk, depth + 1);
   }
 }
 

@@ -544,7 +544,7 @@ table and so one binding. It is also **in-process only**: the binding lives in m
 a second connection to the same file does not yet see it (tracked as F018).
 
 That rule is **enforced, not documented**: `store.collection(...)` walks an object
-schema once at creation and refuses a non-identity field with no `.default(...)`,
+schema at creation and refuses a non-identity field with no `.default(...)`,
 naming the field. A field with no default is not merely un-forward-compatible — its
 `undefined` is dropped by `JSON.stringify`, so the key disappears from the stored row
 entirely and the key set varies row to row, which is exactly the incompleteness a
@@ -553,10 +553,12 @@ stored document must never have. Pass
 
 The object schema is found through whatever wraps it — `.transform()`, `.pipe()`,
 `.brand()`, `.default()`, `z.lazy()` — so a wrapper cannot switch the rule off without
-saying so. A schema that declares no fields at all (`z.string()`, `z.record(...)`) has
-nothing to enforce and is skipped. A schema whose fields are **not one readable shape** —
-a union of object schemas, an intersection — is *refused*, because enforcing nothing there
-would be a rule reporting a check it never ran:
+saying so. A schema that declares no fields of its own (`z.string()`,
+`z.record(z.string(), z.string())`) has nothing of its own to enforce and is skipped,
+though the walk still descends into what a container *stores* — see the boundary below. A
+schema whose fields are **not one readable shape** — a union of object schemas, an
+intersection — is *refused*, because enforcing nothing there would be a rule reporting a
+check it never ran:
 
 ```ts
 store.collection("variants", z.union([DraftSchema, FinalSchema]));
@@ -565,9 +567,40 @@ store.collection("variants", z.union([DraftSchema, FinalSchema]), { enforceDefau
 // accepted — the schema's fields are now yours to hold to the rule
 ```
 
+### How deep the walk goes
+
+The guard's reach *is* the guarantee's reach, so its boundary is stated here rather than
+left to be rediscovered. The walk is **recursive**: a default on an enclosing object does
+not cover its members, because a row that already stores the object is parsed against
+every one of them. The error names the full path.
+
+```ts
+// v1 wrote: { id: "s_old", settings: { theme: "light" } }
+store.collection("s", z.object({
+  id: ref("s"),
+  settings: z.object({ theme: z.string().default("light"), fontSize: z.number() })
+             .default({ theme: "light", fontSize: 14 }),
+}));
+// throws: field "settings.fontSize" has no default …
+// — refused here, rather than accepted and then failing every read of an old row.
+```
+
+| Where the walk goes | What happens |
+| --- | --- |
+| A declared field, at any depth | Held to the rule, then descended into — `settings.fontSize` |
+| What a container stores — an array's elements, a tuple's positions, a record's values | Descended into: each is a schema an already-stored value is parsed against — `tags[].color`, `pair[0].x`, `prefs.<key>.size` |
+| A `ref()` foreign key | Exempt **at any depth** — identity-shaped wherever it sits |
+| A member named like `idField` | Exempt **only at the top level**: that name is the column the rows are keyed by, so a nested `id` is an ordinary field and needs a default — declare a recursive document's identity with `ref()`, which is exempt wherever the cycle reaches it |
+| A nested union or intersection | *Refused*, naming the field, on the same terms as a top-level one |
+| A shape the walk has already seen | Skipped — this is what lets a self-referential schema terminate; its members were held to the rule where they were first reached |
+| A `z.map()` or `z.set()`'s contents | **Skipped on purpose**: neither survives the write gate's JSON round-trip, so no such field reaches storage and there is no stored member to read forward |
+| Nesting more than 10 levels deep | *Refused*: a `z.lazy()` can hand back a fresh schema on every call, which no seen-shape check catches, so the walk is bounded — and it refuses at the bound rather than enforcing nothing past it |
+
 Because it defaults to `true`, this is a **breaking change for an existing schema**:
 every optional field without a default throws at `store.collection(...)` rather
-than silently vanishing from storage. Expect a batch of these the first time an existing
+than silently vanishing from storage — and, since the walk recurses, every *nested* one
+does too, including a schema that opened cleanly under an earlier version of this library.
+Expect a batch of these the first time an existing
 consumer upgrades; fix them at the schema, or pass `{ enforceDefaults: false }` to stage
 the migration.
 

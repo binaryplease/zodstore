@@ -2641,27 +2641,305 @@ describe("the write gate", () => {
       });
     });
 
-    // The walk is one level deep by design: a nested object must itself declare
-    // a default, but its members are not checked. This pins that boundary so the
-    // limit stays a known one rather than an assumed fix.
-    test("the walk is one level deep — a nested member without a default is not caught", () => {
+    // F048 (#11) — the walk read one shape and stopped, so a member nested
+    // inside a defaulted object was never asked for a default of its own. The
+    // parent's `.default(…)` does not cover it: a row that already stores the
+    // object is parsed against every member of it, so the extension below made
+    // every row written before it unreadable — in production, on the first read
+    // of one particular old row, rather than here where the schema was written.
+    // This is the test that used to pin the depth-1 limit, inverted.
+    test("a nested member without a default is refused, naming the full path (F048)", () => {
       const store = createStore();
-      const nested = store.collection(
-        "nested",
+      const version1 = z.object({
+        id: ref("s"),
+        settings: z.object({ theme: z.string().default("light") }).default({ theme: "light" }),
+      });
+      store.collection("s", version1).insert({ id: "s_old" });
+      expect(storedText(store, "s", "s_old")).toBe('{"id":"s_old","settings":{"theme":"light"}}');
+
+      const version2 = z.object({
+        id: ref("s"),
+        settings: z
+          .object({ theme: z.string().default("light"), fontSize: z.number() })
+          .default({ theme: "light", fontSize: 14 }),
+      });
+      expect(() => store.collection("s", version2)).toThrow(
+        /field "settings\.fontSize" has no default/,
+      );
+
+      // What that refusal stands in front of: with the rule taken off, the
+      // schema opens and the row written under version 1 no longer reads.
+      const unguarded = store.collection("s", version2, { enforceDefaults: false });
+      expect(() => unguarded.get("s_old")).toThrow(/does not match the current schema/);
+
+      // Recursion rather than a second level: one deeper again is the same refusal.
+      expect(() =>
+        store.collection(
+          "deep",
+          z.object({
+            id: ref("d"),
+            a: z
+              .object({ b: z.object({ c: z.string() }).default({ c: "" }) })
+              .default({ b: { c: "" } }),
+          }),
+        ),
+      ).toThrow(/field "a\.b\.c" has no default/);
+    });
+
+    test("a nested object whose members all declare defaults is accepted (F048)", () => {
+      const store = createStore();
+      const profiles = store.collection(
+        "profiles",
         z.object({
-          id: ref("n"),
-          meta: z.object({ note: z.string().optional() }).default({}),
+          id: ref("p"),
+          settings: z
+            .object({
+              theme: z.string().default("light"),
+              layout: z.object({ columns: z.number().default(2) }).default({ columns: 2 }),
+            })
+            .default({ theme: "light", layout: { columns: 2 } }),
         }),
       );
-      nested.insert({ id: "n_1" });
-      // The known limit: `note` is dropped from storage exactly as F015 describes,
-      // one level down. Recursing would need Zod internals to unwrap `.default()`,
-      // which `hasDeclaredDefault` deliberately avoids for the ^3 || ^4 peer range.
-      expect(storedText(store, "nested", "n_1")).toBe('{"id":"n_1","meta":{}}');
-      // The nested object itself is still held to the rule.
+      expect(profiles.insert({ id: "p_1" })).toEqual({
+        id: "p_1",
+        settings: { theme: "light", layout: { columns: 2 } },
+      });
+    });
+
+    // The two exemptions do not travel together below the top level. A foreign
+    // key is identity-shaped wherever it sits; `idField` names the column this
+    // collection keys its rows by, which is a top-level concept, so a nested
+    // member that happens to share the name is an ordinary field (F048).
+    test("at depth a ref() stays exempt and a member named like the id field does not", () => {
+      const store = createStore();
+      const posts = store.collection(
+        "posts",
+        z.object({
+          id: ref("post"),
+          meta: z
+            .object({ ownerId: ref("user"), editorId: ref("user").nullable() })
+            .default({ ownerId: "user_a", editorId: null }),
+        }),
+      );
+      expect(posts.insert({ id: "post_1" }).meta).toEqual({
+        ownerId: "user_a",
+        editorId: null,
+      });
+
       expect(() =>
-        store.collection("nested2", z.object({ id: ref("n"), meta: z.object({}) })),
-      ).toThrow(/field "meta" has no default/);
+        store.collection(
+          "shadowed",
+          z.object({
+            id: ref("s"),
+            meta: z.object({ id: z.string() }).default({ id: "" }),
+          }),
+        ),
+      ).toThrow(/field "meta\.id" has no default/);
+    });
+
+    // A container declares no fields of its own, but what it *stores* is parsed
+    // against a declared schema, so an old row's array element or record value
+    // breaks on an added defaultless member exactly as a nested object does.
+    // The path names the container as the reader sees it (F048).
+    test("the walk reaches what an array, a tuple and a record store (F048)", () => {
+      const store = createStore();
+      const gapped = () => z.object({ name: z.string().default(""), color: z.string() });
+      const containers: Array<{ path: string; member: z.ZodType }> = [
+        { path: "holder[].color", member: z.array(gapped()).default([]) },
+        { path: "holder[0].color", member: z.tuple([gapped()]).default([{ name: "", color: "" }]) },
+        { path: "holder.<key>.color", member: z.record(z.string(), gapped()).default({}) },
+      ];
+      for (const { path, member } of containers) {
+        expect(
+          () => store.collection("containers", z.object({ id: ref("c"), holder: member })),
+          path,
+        ).toThrow(`field "${path}" has no default`);
+      }
+      // The same containers with every member declared are accepted, so the
+      // descent is into the gap and not into the container.
+      expect(() =>
+        store.collection(
+          "sound",
+          z.object({
+            id: ref("c"),
+            tags: z.array(z.object({ name: z.string().default("") })).default([]),
+            byKey: z.record(z.string(), z.object({ name: z.string().default("") })).default({}),
+          }),
+        ),
+      ).not.toThrow();
+      // A container of scalars declares nothing to descend into.
+      expect(() =>
+        store.collection(
+          "scalars",
+          z.object({ id: ref("c"), tags: z.array(z.string()).default([]) }),
+        ),
+      ).not.toThrow();
+    });
+
+    // A container is read through each peer major's internals — Zod 4 keeps an
+    // array's element under `element` and Zod 3 under `type`, and Zod 3's record
+    // exposes an `.element` that is its *value* schema — so the descent is proved
+    // on both majors rather than reasoned about on one (F048).
+    test("the nested walk reaches the same members under the older declared peer major", () => {
+      const store = createStore();
+      const legacyNested = zodThree.object({
+        id: zodThree.string(),
+        settings: zodThree
+          .object({ theme: zodThree.string().default("light"), fontSize: zodThree.number() })
+          .default({ theme: "light", fontSize: 14 }),
+      }) as unknown as z.ZodType;
+      expect(() => store.collection("legacy", legacyNested)).toThrow(
+        /field "settings\.fontSize" has no default/,
+      );
+
+      const legacyGapped = () => zodThree.object({ color: zodThree.string() });
+      const legacyContainers: Array<{ path: string; member: unknown }> = [
+        { path: "holder[].color", member: zodThree.array(legacyGapped()).default([]) },
+        {
+          // Zod 3 parses a `.default(…)` through the schema it defaults, so the
+          // value has to be a whole member — the gap is in the schema, not here.
+          path: "holder[0].color",
+          member: zodThree.tuple([legacyGapped()]).default([{ color: "" }]),
+        },
+        {
+          path: "holder.<key>.color",
+          member: zodThree.record(zodThree.string(), legacyGapped()).default({}),
+        },
+      ];
+      for (const { path, member } of legacyContainers) {
+        const schema = zodThree.object({
+          id: zodThree.string(),
+          holder: member as never,
+        }) as unknown as z.ZodType;
+        expect(() => store.collection("legacy", schema), path).toThrow(
+          `field "${path}" has no default`,
+        );
+      }
+
+      // And the same shapes with every member declared still open.
+      const sound = zodThree.object({
+        id: zodThree.string(),
+        settings: zodThree
+          .object({ theme: zodThree.string().default("light") })
+          .default({ theme: "light" }),
+        tags: zodThree.array(zodThree.object({ name: zodThree.string().default("") })).default([]),
+      }) as unknown as z.ZodType;
+      expect(store.collection("legacySound", sound).insert({ id: "r_1" })).toEqual({
+        id: "r_1",
+        settings: { theme: "light" },
+        tags: [],
+      });
+    });
+
+    // Where the walk stops, on purpose: a `z.map()` and a `z.set()` hold values
+    // this library can read, and are skipped anyway — neither survives the write
+    // gate's JSON round-trip (F003), so no such field ever reaches storage and
+    // there is no stored member to read forward. The skip is asserted here so it
+    // stays a decision rather than becoming the next rediscovered limit (F048).
+    test("a z.map() and a z.set() are not walked into — the write gate refuses them first", () => {
+      const store = createStore();
+      const rooms = store.collection(
+        "rooms",
+        z.object({
+          id: ref("r"),
+          // `name` has no default, and is not reported: the walk does not enter here.
+          occupants: z
+            .map(z.string(), z.object({ name: z.string() }))
+            .default(new Map()) as unknown as z.ZodType,
+          seats: z.set(z.object({ name: z.string() })).default(new Set()) as unknown as z.ZodType,
+        }),
+      );
+      expect(() => rooms.insert({ id: "r_1" } as never)).toThrow(
+        /does not survive a JSON round-trip/,
+      );
+      expect(rooms.count()).toBe(0);
+    });
+
+    // The F020 refusal, one level down: "declares no fields" and "declares
+    // fields I cannot read as one shape" stay two answers at depth too, and the
+    // second is refused rather than enforced-nothing — naming the field, so the
+    // caller is not left bisecting the schema for it (F048).
+    test("a nested union is refused like a top-level one, naming the field (F048)", () => {
+      const store = createStore();
+      const block = z
+        .union([
+          z.object({ kind: z.literal("text").default("text"), text: z.string().default("") }),
+          z.object({ kind: z.literal("image").default("image"), url: z.string().default("") }),
+        ])
+        .default({ kind: "text", text: "" });
+      const pages = z.object({ id: ref("p"), block });
+      expect(() => store.collection("pages", pages)).toThrow(
+        /field "block" declares fields that cannot be read as one shape/,
+      );
+      expect(() =>
+        store.collection("pages", pages, { enforceDefaults: false }),
+      ).not.toThrow();
+      // A nested union that declares no fields at all is skipped, exactly as at
+      // the top level.
+      expect(() =>
+        store.collection(
+          "mixed",
+          z.object({ id: ref("m"), value: z.union([z.string(), z.number()]).default("") }),
+        ),
+      ).not.toThrow();
+    });
+
+    // Where the walk stops, on purpose: a shape it has already walked is not
+    // walked again, which is what lets a self-referential schema terminate.
+    test("a self-referential schema terminates and is still enforced (F048)", () => {
+      const store = createStore();
+      // Annotated, because the schema names itself in its own initializer — the
+      // shape the walk has to terminate on.
+      const CategorySchema: z.ZodType = z.object({
+        id: ref("cat"),
+        name: z.string().default(""),
+        children: z.lazy(() => z.array(CategorySchema)).default([]),
+      });
+      const categories = store.collection("categories", CategorySchema);
+      expect(categories.insert({ id: "cat_1" })).toEqual({
+        id: "cat_1",
+        name: "",
+        children: [],
+      });
+
+      // The cycle does not buy an exemption for the members reached through it:
+      // the same schema with a gap is refused, at the path the gap sits at.
+      const GappedSchema: z.ZodType = z.object({
+        id: ref("cat"),
+        meta: z.object({ slug: z.string() }).default({ slug: "" }),
+        children: z.lazy(() => z.array(GappedSchema)).default([]),
+      });
+      expect(() => store.collection("gapped", GappedSchema)).toThrow(
+        /field "meta\.slug" has no default/,
+      );
+
+      // And the `idField` exemption does not travel around the cycle either: the
+      // collection's own shape is the one walked under it, so the same shape
+      // reached again one level in holds a plain-string `id` to the rule. A
+      // recursive document declares its identity with ref(), which is exempt at
+      // any depth — CategorySchema above does, and opens.
+      const PlainIdSchema: z.ZodType = z.object({
+        id: z.string(),
+        children: z.lazy(() => z.array(PlainIdSchema)).default([]),
+      });
+      expect(() => store.collection("plain", PlainIdSchema)).toThrow(
+        /field "children\[\]\.id" has no default/,
+      );
+    });
+
+    // And where it stops when nothing else can stop it: a `z.lazy()` may hand
+    // back a *fresh* schema on every call, which no shape-identity check
+    // catches, so the walk is bounded — and refuses at the bound rather than
+    // enforcing nothing past it (F048).
+    test("nesting past the walk's bound is refused, not skipped (F048)", () => {
+      const store = createStore();
+      let nested: z.ZodType = z.object({ leaf: z.string().default("") });
+      for (let level = 0; level < 12; level += 1) {
+        nested = z.object({ nested: nested.default({} as never) });
+      }
+      const schema = z.object({ id: ref("x"), nested: nested.default({} as never) });
+      expect(() => store.collection("towers", schema)).toThrow(/nests more than \d+ levels deep/);
+      expect(() => store.collection("towers", schema, { enforceDefaults: false })).not.toThrow();
     });
 
     test("the check is escapable and skips a non-object schema", () => {
