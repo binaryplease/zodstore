@@ -13,6 +13,28 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
 
 ### Fixed
 
+- **A `like` operand that is not a string is now refused instead of compiling a
+  filter that matches nothing.** `like` was the one operator in the LIKE family
+  without an operand guard: `contains`, `startsWith` and `endsWith` all refuse a
+  non-string naming the operator, while `like` pushed its operand straight to the
+  parameter binder, which refuses only `NaN` and an invalid `Date`. `LIKE NULL`
+  is `NULL` for every row, so the filter answered nothing and an empty answer is
+  indistinguishable from a truthful "no rows"
+  ([#16](https://github.com/binaryplease/zodstore/issues/16)).
+
+  ```ts
+  users.find({ where: { nick: { like: null } } });
+  // was: [] — no error, and a deleteMany carrying it removed nothing
+  // now: throws: Operator "like" expects a string operand, got null
+  users.find({ where: { nick: { like: "%ee%" } } }); // unchanged
+  ```
+
+  `like` is declared `?: string`, so the `null` an HTTP layer forwards reached it
+  without a cast. The raw-pattern semantics of a *valid* string operand are
+  untouched — `like` is still the escape hatch where the caller's own wildcards
+  and the `ESCAPE '\'` clause mean what SQL means; only the operand's type is
+  read first, and it is returned verbatim rather than escaped.
+
 - **Two index declarations can no longer collapse onto one name, silently
   dropping a UNIQUE.** The index name replaced every `.` in a field path with
   `_`, so the distinct paths `a.b` and `a_b` produced one name — and the

@@ -548,6 +548,42 @@ describe("a nonsense operand is refused, never answered emptily (F046)", () => {
     ]);
   });
 
+  test("like requires the string it declares, like the three escaped operators (#16)", () => {
+    const users = seeded();
+    // `like` was the one LIKE-family operator with no operand guard: it pushed
+    // straight to `toSqlParameter`, which refuses only NaN and an invalid Date.
+    // `LIKE NULL` is NULL for every row, so these compiled to a filter that
+    // matched nothing and reported it as a truthful "no rows".
+    for (const [operand, described] of [
+      [null, "null"],
+      [5, "number"],
+      [true, "boolean"],
+      [["mine"], "an array"],
+    ] as const) {
+      expect(() =>
+        users.find({ where: { nickname: { like: operand as unknown as string } } }),
+      ).toThrow(new RegExp(`Operator "like" expects a string operand, got ${described}`));
+      expect(() =>
+        users.deleteMany({ nickname: { like: operand as unknown as string } }),
+      ).toThrow(new RegExp(`Operator "like" expects a string operand, got ${described}`));
+    }
+    expect(users.count()).toBe(2);
+
+    // The refusal names the operator the way its three siblings do.
+    expect(() =>
+      users.find({ where: { nickname: { contains: null as unknown as string } } }),
+    ).toThrow(/Operator "contains" expects a string operand, got null/);
+
+    // …and a string operand still answers, wildcards and all, unchanged.
+    expect(users.find({ where: { nickname: { like: "mi%" } } }).map((user) => user.id)).toEqual([
+      "user_mine",
+    ]);
+    expect(compileWhere({ nickname: { like: "%mi_e%" } })).toEqual({
+      sql: String.raw`WHERE json_extract(doc, '$.nickname') LIKE ? ESCAPE '\'`,
+      parameters: ["%mi_e%"],
+    });
+  });
+
   test("a Date operand still travels the tightened path unchanged (F029)", () => {
     // `toSqlParameter` is shared, so tightening the number branch had to leave
     // the Date branch — and its own refusals — exactly where they were.

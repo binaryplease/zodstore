@@ -116,9 +116,11 @@ operator or field at fault.
 filter that quietly matches nothing reads exactly like a truthful "no rows", so the
 operand is named instead: `NaN` (which is what `Number(badQueryParam)` produces, and which
 binds as SQL `NULL`), a non-boolean `isNull` (`"false"` is what `?isNull=false` yields
-before anything parses it, and it used to select the rows it was written to exclude), and
-a `null` operand to `gt`/`gte`/`lt`/`lte` (a range comparison against no value has no
-answer — `isNull` or `eq: null` is the spelling that does). `Infinity` and `-Infinity`
+before anything parses it, and it used to select the rows it was written to exclude), a
+`null` operand to `gt`/`gte`/`lt`/`lte` (a range comparison against no value has no
+answer — `isNull` or `eq: null` is the spelling that does), and a non-string operand to
+`contains`/`startsWith`/`endsWith`/`like` (a pattern is text; `LIKE NULL` is `NULL` for
+every row). `Infinity` and `-Infinity`
 pass: they bind as numbers and order against every stored value, so `{ age: { lt:
 Infinity } }` is the "any number" filter it looks like.
 
