@@ -847,6 +847,45 @@ describe("OR / NOT combinators (F012)", () => {
     ).toThrow(/field "NOT" is a reserved where-clause key/);
   });
 
+  // F020 — the guard read `schema.shape` directly, so an object schema wrapped
+  // in anything that hides `.shape` walked straight past it. The collision it
+  // exists to refuse is silent on the other side: the field is matched as a
+  // combinator before it can reach `jsonExtract`, so `{ NOT: { eq: "v" } }`
+  // compiled to `WHERE NOT (json_extract(doc, '$.eq') = ?)` and answered with
+  // rows that do not match — through `deleteMany`, a silently wrong delete.
+  test("a wrapped object schema is refused for a reserved field name too (F020)", () => {
+    const wrapped = {
+      transform: z
+        .object({ id: ref("b"), NOT: z.string().default("") })
+        .transform((document) => document),
+      pipe: z
+        .object({ id: ref("b"), NOT: z.string().default("") })
+        .pipe(z.object({ id: z.string(), NOT: z.string() })),
+      brand: z.object({ id: ref("b"), NOT: z.string().default("") }).brand<"Doc">(),
+      default: z
+        .object({ id: ref("b"), NOT: z.string().default("") })
+        .default({ id: "b_1", NOT: "" }),
+      readonly: z.object({ id: ref("b"), NOT: z.string().default("") }).readonly(),
+      lazy: z.lazy(() => z.object({ id: ref("b"), NOT: z.string().default("") })),
+    };
+    for (const [label, schema] of Object.entries(wrapped)) {
+      const store = createStore();
+      expect(
+        () => store.collection("bad", schema as unknown as z.ZodType),
+        `wrapped in .${label}()`,
+      ).toThrow(/field "NOT" is a reserved where-clause key/);
+    }
+  });
+
+  test("the same wrappers create a collection when no field is reserved (F020)", () => {
+    const store = createStore();
+    const notes = store.collection(
+      "notes",
+      z.object({ id: ref("n"), body: z.string().default("") }).transform((document) => document),
+    );
+    expect(notes.insert({ id: "n_1", body: "kept" })).toEqual({ id: "n_1", body: "kept" });
+  });
+
   // F051 — the reserved names were written out twice, in the two files that have
   // to agree about them, with no import and no type relating the lists. The
   // guard above was correct only for as long as somebody remembered to edit
@@ -2388,6 +2427,167 @@ describe("the write gate", () => {
       expect(keyed.insert({ key: "k_1", ownerId: "user_a" }).title).toBe("");
     });
 
+    // F044 — the exemption was carried by the schema *object* `ref()` returned,
+    // held in a WeakSet. Zod schemas are immutable, so every chained method
+    // returns a new object the set does not hold, and the ordinary shape of an
+    // optional relation was refused with a message naming the exemption it was
+    // refusing to grant. `.describe()` was refused too, though it changes
+    // nothing about the field. Both ways out were wrong: a `.default(null)` on a
+    // foreign key is a fabricated reference, and `{ enforceDefaults: false }`
+    // takes the rule off every other field on the table.
+    test("a ref() keeps the exemption through a wrapper (F044)", () => {
+      const store = createStore();
+      const posts = store.collection(
+        "posts",
+        z.object({
+          id: ref("post"),
+          authorId: ref("user").nullable(),
+          editorId: ref("user").optional(),
+          reviewerId: ref("user").describe("who signed it off").nullable(),
+          approverId: ref("user").refine(() => true).nullable(),
+          title: z.string().default(""),
+        }),
+      );
+      expect(
+        posts.insert({ id: "post_1", authorId: null, reviewerId: null, approverId: null }),
+      ).toEqual({
+        id: "post_1",
+        authorId: null,
+        reviewerId: null,
+        approverId: null,
+        title: "",
+      });
+      // The explicit null round-trips through storage as itself.
+      expect(posts.get("post_1")?.authorId).toBe(null);
+      expect(storedText(store, "posts", "post_1")).toContain('"authorId":null');
+      // A populated reference still validates on the way in.
+      expect(() =>
+        posts.insert({ id: "post_2", authorId: "nope_1", reviewerId: null, approverId: null }),
+      ).toThrow();
+    });
+
+    // The other half of F044: a fix that unwraps too eagerly exempts every
+    // nullable field and closes the guard instead of the gap. Only a reference
+    // is identity-shaped — an ordinary field wrapped the same way is not.
+    test("an ordinary field wrapped the same way is still refused (F044)", () => {
+      const store = createStore();
+      for (const wrapper of ["nullable", "optional", "describe", "readonly"] as const) {
+        const note =
+          wrapper === "describe" ? z.string().describe("a note") : z.string()[wrapper]();
+        expect(
+          () => store.collection("opts", z.object({ id: ref("o"), note })),
+          `note wrapped in .${wrapper}()`,
+        ).toThrow(/field "note" has no default/);
+      }
+    });
+
+    // The boundary the exemption stops at, stated in ref()'s JSDoc: a default on
+    // a foreign key invents a reference to a row that may not exist, so such a
+    // field is no longer identity-shaped. It is accepted on the ordinary rule
+    // instead — it declares a default — rather than through the exception.
+    test("a ref() with a default is held to the ordinary rule, and passes it", () => {
+      const store = createStore();
+      const rows = store.collection(
+        "assignments",
+        z.object({ id: ref("a"), ownerId: ref("user").default("user_unassigned") }),
+      );
+      expect(rows.insert({ id: "a_1" }).ownerId).toBe("user_unassigned");
+    });
+
+    // F020 — the guard read `schema.shape` directly and treated an absent
+    // `.shape` as "nothing to enforce". That is true of `z.string()`; it is not
+    // true of an object schema under a wrapper, which has fields and no
+    // `.shape`, so the rule that makes "no migrations" true switched itself off
+    // without saying so on the exact shape the write gate invites.
+    test("a wrapped object schema is walked exactly like the bare one (F020)", () => {
+      const bare = () => z.object({ id: ref("o"), note: z.string().optional() });
+      const wrapped = {
+        transform: bare().transform((document) => document),
+        pipe: bare().pipe(bare()),
+        brand: bare().brand<"Doc">(),
+        default: bare().default({ id: "o_1" }),
+        readonly: bare().readonly(),
+        lazy: z.lazy(bare),
+        "nullable.transform": bare().transform((document) => document).nullable(),
+      };
+      for (const [label, schema] of Object.entries(wrapped)) {
+        const store = createStore();
+        expect(
+          () => store.collection("opts", schema as unknown as z.ZodType),
+          `wrapped in .${label}()`,
+        ).toThrow(/field "note" has no default/);
+      }
+    });
+
+    // The deliberate half of F020: "declares no fields" and "declares fields I
+    // cannot read as one shape" used to be the same answer — skip — so a union
+    // of two object schemas was waved through on the same terms as `z.string()`.
+    // The second answer is now a refusal, because enforcing nothing there is a
+    // rule reporting a check it never ran.
+    test("a schema whose fields are not one shape is refused, not skipped (F020)", () => {
+      const store = createStore();
+      const draft = z.object({ id: ref("d"), kind: z.literal("draft").default("draft") });
+      const final = z.object({ id: ref("d"), kind: z.literal("final").default("final") });
+      const unreadable = {
+        union: z.union([draft, final]),
+        discriminatedUnion: z.discriminatedUnion("kind", [draft, final]),
+        intersection: z.intersection(draft, z.object({ note: z.string().optional() })),
+        "wrapped union": z.union([draft, final]).transform((document) => document),
+      };
+      for (const [label, schema] of Object.entries(unreadable)) {
+        expect(
+          () => store.collection("variants", schema as unknown as z.ZodType),
+          label,
+        ).toThrow(/fields cannot be read as one shape/);
+        // The message names the way past it, and it is the caller's to take.
+        expect(() =>
+          store.collection("variants", schema as unknown as z.ZodType, {
+            enforceDefaults: false,
+          }),
+        ).not.toThrow();
+      }
+      // A union that declares no fields at all declares nothing to enforce, and
+      // is skipped like any other shapeless schema.
+      expect(() =>
+        store.collection("scalars", z.union([z.string(), z.number()])),
+      ).not.toThrow();
+    });
+
+    // Both guards read the schema through the same helper, and the two peer
+    // majors keep a wrapper's inner schema under different keys — Zod 4 pipes a
+    // `.transform()` through `in`, Zod 3 wraps it in a `ZodEffects` — so the
+    // reach is proved on both rather than reasoned about on one.
+    test("the wrapped schema is walked under the older declared peer major too", () => {
+      const store = createStore();
+      const legacy = zodThree
+        .object({ id: zodThree.string(), note: zodThree.string().optional() })
+        .transform((document) => document) as unknown as z.ZodType;
+      expect(() => store.collection("legacy", legacy)).toThrow(/field "note" has no default/);
+
+      const legacyReserved = zodThree
+        .object({ id: zodThree.string(), NOT: zodThree.string().default("") })
+        .transform((document) => document) as unknown as z.ZodType;
+      expect(() => store.collection("legacy", legacyReserved)).toThrow(
+        /field "NOT" is a reserved where-clause key/,
+      );
+
+      const legacyBranded = zodThree
+        .object({ id: zodThree.string(), note: zodThree.string().optional() })
+        .brand<"Doc">() as unknown as z.ZodType;
+      expect(() => store.collection("legacy", legacyBranded)).toThrow(
+        /field "note" has no default/,
+      );
+
+      // And the same schema with every field declared still opens.
+      const sound = zodThree
+        .object({ id: zodThree.string(), note: zodThree.string().default("") })
+        .transform((document) => document) as unknown as z.ZodType;
+      expect(store.collection("legacy", sound).insert({ id: "r_1" })).toEqual({
+        id: "r_1",
+        note: "",
+      });
+    });
+
     // The walk is one level deep by design: a nested object must itself declare
     // a default, but its members are not checked. This pins that boundary so the
     // limit stays a known one rather than an assumed fix.
@@ -2419,9 +2619,12 @@ describe("the write gate", () => {
         { enforceDefaults: false },
       );
       expect(loose.insert({ id: "l_1" })).toEqual({ id: "l_1" });
-      // A schema with no shape to walk is skipped rather than refused.
+      // A schema that declares no fields at all is skipped rather than refused —
+      // the answer that stayed unchanged when F020 split it from "declares
+      // fields I cannot read".
       const records = store.collection("records", z.record(z.string(), z.string()));
       expect(records.insert({ id: "r_1", note: "kept" }).note).toBe("kept");
+      expect(() => store.collection("scalars", z.string())).not.toThrow();
     });
   });
 

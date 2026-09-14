@@ -13,6 +13,67 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
 
 ### Fixed
 
+- **Both collection guards now see through the wrappers around a schema.**
+  `assertNoReservedFieldNames` and `assertDefaultsDeclared` each read
+  `schema.shape` and treated an absent `.shape` as "nothing to enforce". That is
+  true of `z.string()`; it is not true of `z.object({…}).transform(…)`,
+  `.pipe()`, `.brand()` or `.default()`, which have fields and no `.shape` — so
+  the two checks this library performs where a schema is declared silently did
+  nothing on a schema spelled that way (F020,
+  [#2](https://github.com/binaryplease/zodstore/issues/2)):
+
+  ```ts
+  const Doc = z.object({ id: ref("d"), NOT: z.string().default("") }).transform((doc) => doc);
+  const rows = store.collection("rows", Doc);           // was accepted, now throws
+  rows.find({ where: { NOT: { eq: "v" } } });           // was 0 rows of 1 — "NOT" read as the combinator
+  ```
+
+  Past the reserved-name guard the collision is silent, not loud: the field is
+  matched as a where-clause combinator before it can reach `json_extract`, so the
+  filter above compiled to `WHERE NOT (json_extract(doc, '$.eq') = ?)` and
+  answered with rows that do not match — through `deleteMany`, a silently wrong
+  delete. The defaults half is the costlier one: a `.transform()` on a stored
+  schema turned off the rule that makes "no migrations" true, and the write gate
+  explicitly permits an idempotent transform, so the library invited the exact
+  shape that disabled its own guards.
+
+  Both guards now read the schema through one helper (`src/schema-shape.ts`)
+  that follows `.transform()`, `.pipe()`, `.brand()`, `.refine()`, `.optional()`,
+  `.nullable()`, `.default()`, `.catch()`, `.readonly()` and `z.lazy()` to the
+  object underneath, on both declared peer majors. It is deliberately a second
+  reader rather than a reuse of `unwrapSchema`/`declaredShape`: those answer what
+  a value honestly *is* after every transform has run — which is why they refuse
+  to follow a `.transform()`, and that refusal stays load-bearing for the write
+  gate's path elision — while this one answers what the schema *declares*.
+
+- **A `ref()` keeps its identity exemption through a wrapper.** The exemption
+  from the declared-default rule was carried by the schema *object* `ref()`
+  returned, held in a `WeakSet`. Zod schemas are immutable, so every chained
+  method returns a new object the set does not hold, and the ordinary shape of an
+  optional relation was refused with a message naming the exemption it was
+  refusing to grant (F044,
+  [#7](https://github.com/binaryplease/zodstore/issues/7)):
+
+  ```ts
+  store.collection("posts", z.object({ id: ref("post"), authorId: ref("user").nullable() }));
+  // was: field "authorId" has no default … now: accepted, and `authorId: null` round-trips
+  ```
+
+  `ref("user").optional()` and even `ref("user").describe("the author")` were
+  refused the same way, though the latter changes nothing about the field. Both
+  ways out were wrong in a way the caller could feel: a `.default(null)` on a
+  foreign key is a fabricated reference re-entering storage on every write, and
+  `{ enforceDefaults: false }` is collection-wide — one optional relation took
+  the rule off every other field on the table, which is the failure mode of an
+  enforcement mechanism rather than an inconvenience.
+
+  The mark now sits on the schema's definition, which both peer majors copy when
+  a schema is chained from it, and the wrappers that build a new definition
+  around the old one are followed. `.nullable()`, `.optional()`, `.describe()`,
+  `.brand()` and `.refine()` keep the exemption; an ordinary field wrapped the
+  same way — `z.string().nullable()` — is still refused, because only a
+  reference is identity-shaped.
+
 - **`ne` and `notIn` no longer drop the rows whose value is `NULL`.** Both
   compiled to the bare SQL predicate — `expr <> ?` and `expr NOT IN (…)` — and
   in SQL each of those evaluates to `NULL`, not true, when the left side is
@@ -103,6 +164,23 @@ diffing trees (F008). Releases from `0.4.2` on are published to npm as
 
 ### Changed
 
+- **A schema whose fields are not one readable shape is now refused rather than
+  skipped.** A union of object schemas or an intersection declares fields, but
+  not as one shape this library can read, and "declares no fields" and "declares
+  fields I cannot read" used to be the same answer — skip. Enforcing nothing
+  there is a rule reporting a check it never ran, so the second answer is now a
+  throw at `store.collection(...)` naming `{ enforceDefaults: false }` as the way
+  past it. That option takes the declared-default rule off every field of the
+  collection, which makes the exception a caller's decision rather than an
+  accident of how the schema was spelled. A schema that declares no fields at all
+  — `z.string()`, `z.record(...)`, a union of scalars — is skipped exactly as
+  before. This is the decision `F020` asked to be made deliberately.
+- **A `.default(...)` on a `ref()` is no longer identity-shaped.** A defaulted
+  foreign key invents a reference to a row that may not exist, which is what the
+  identity exemption exists to prevent, so such a field is held to the ordinary
+  rule instead — and passes it, because it declares a default. No schema changes
+  its verdict; the boundary is now stated in `ref()`'s JSDoc and in `README.md`
+  rather than decided by which object a `WeakSet` happened to hold.
 - **A `null` inside an `in`/`notIn` list now names the rows that have no
   value.** It used to bind as a parameter, and no row equals a bound `NULL`, so
   `in: [null]` matched nothing and `notIn: [null]` excluded nothing — the list

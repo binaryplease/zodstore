@@ -305,9 +305,13 @@ a row whose `name` is `null`, because `null = 'Ann'` is unknown rather than fals
 `{ OR: [{ NOT: { name: "Ann" } }, { name: null }] }` when you want the nulls too.
 
 The keys are uppercase so they cannot be mistaken for fields, and `store.collection(...)`
-refuses an **object** schema carrying a field named `OR` or `NOT`. A schema whose shape it
-cannot read — one wrapped in `.transform()`, `.pipe()`, or a union — is not walked, so
-that guard is a strong default rather than a proof; do not name a field `OR` or `NOT`.
+refuses an **object** schema carrying a field named `OR` or `NOT` — including one under a
+wrapper that hides its `.shape`, such as `.transform()`, `.pipe()`, `.brand()` or
+`.default()`. A schema whose fields are not one readable shape — a union of object
+schemas, an intersection — only reaches a collection under `{ enforceDefaults: false }`
+(see [Forward compatibility](#forward-compatibility-no-migrations)), and there the field
+names are yours to keep
+clear of these two.
 
 A `where` is a nested, JSON-shaped structure, and it is a plain TypeScript type rather
 than a Zod schema — the deliberate in-process exception to Zod owning every shape,
@@ -503,7 +507,17 @@ store.collection("users", UsersV2).get("user_legacy");
 
 Identity fields (`id`, foreign keys) carry no default and fail loudly when absent —
 a fabricated id is worse than a missing one. They are the honest exception to the
-default rule.
+default rule, and the exemption survives the wrappers that leave a foreign key's
+identity intact, so a nullable relation is written as it reads:
+
+```ts
+z.object({ id: ref("post"), authorId: ref("user").nullable() });   // accepted, no default
+```
+
+`.nullable()`, `.optional()`, `.describe()`, `.brand()` and `.refine()` all keep it. A
+`.default(...)` on a reference ends it: a defaulted foreign key invents a reference to a
+row that may not exist, so it is held to the ordinary rule — which it passes, because it
+declares a default.
 
 Reopening a collection may extend the schema and may declare further indexes, which are
 cumulative across handles. It may **not** change `idField`: identity is what the stored
@@ -526,17 +540,27 @@ naming the field. A field with no default is not merely un-forward-compatible �
 `undefined` is dropped by `JSON.stringify`, so the key disappears from the stored row
 entirely and the key set varies row to row, which is exactly the incompleteness a
 stored document must never have. Pass
-`{ enforceDefaults: false }` for a deliberate exception; a non-object schema has no
-shape to walk and is skipped.
+`{ enforceDefaults: false }` for a deliberate exception.
+
+The object schema is found through whatever wraps it — `.transform()`, `.pipe()`,
+`.brand()`, `.default()`, `z.lazy()` — so a wrapper cannot switch the rule off without
+saying so. A schema that declares no fields at all (`z.string()`, `z.record(...)`) has
+nothing to enforce and is skipped. A schema whose fields are **not one readable shape** —
+a union of object schemas, an intersection — is *refused*, because enforcing nothing there
+would be a rule reporting a check it never ran:
+
+```ts
+store.collection("variants", z.union([DraftSchema, FinalSchema]));
+// throws: the schema's fields cannot be read as one shape …
+store.collection("variants", z.union([DraftSchema, FinalSchema]), { enforceDefaults: false });
+// accepted — the schema's fields are now yours to hold to the rule
+```
 
 Because it defaults to `true`, this is a **breaking change for an existing schema**:
-every optional field without a default now throws at `store.collection(...)` rather
-than silently vanishing from storage. That includes `ref("user").optional()`, the
-natural spelling of a nullable foreign key — the identity exemption is carried by the
-schema object `ref()` returns, so any wrapper drops it. Write it
-`ref("user").nullable().default(null)`, which stores the explicit `null` you want anyway.
-Expect a batch of these the first time an existing consumer upgrades; fix them at the
-schema, or pass `{ enforceDefaults: false }` to stage the migration.
+every optional field without a default throws at `store.collection(...)` rather
+than silently vanishing from storage. Expect a batch of these the first time an existing
+consumer upgrades; fix them at the schema, or pass `{ enforceDefaults: false }` to stage
+the migration.
 
 ## The write gate
 

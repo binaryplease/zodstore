@@ -138,9 +138,13 @@ export type ValueAtPath<TDocument, TPath> = TPath extends `${infer Head}.${infer
  * alternatives (an empty list matches nothing), `NOT` negates one nested
  * clause. Both nest arbitrarily. They are uppercase so they cannot be mistaken
  * for a field, and `createCollection` refuses an **object** schema carrying a
- * field named `OR` or `NOT`. A schema with no readable shape — one wrapped in
- * `.transform()`, `.pipe()`, a union — is not walked, so the guard is a strong
- * default rather than a proof.
+ * field named `OR` or `NOT` — including one under a wrapper that hides its
+ * `.shape`, such as `.transform()`, `.pipe()`, `.brand()` or `.default()`.
+ *
+ * One case is left: a schema whose fields are not one readable shape — a union
+ * of object schemas, an intersection — reaches a collection only under
+ * `{ enforceDefaults: false }`, and its field names are then the caller's to
+ * keep clear of these two.
  */
 export type Where<TDocument> = {
   [Path in FieldPath<TDocument>]?: FieldCondition<ValueAtPath<TDocument, Path>>;

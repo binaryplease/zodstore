@@ -8,6 +8,7 @@ import {
   RESERVED_WHERE_KEYS,
 } from "./query.ts";
 import { isReference } from "./ref.ts";
+import { hasDeclaredDefault, readObjectShape } from "./schema-shape.ts";
 import type {
   IndexDefinition,
   IndexInput,
@@ -52,8 +53,17 @@ export interface CollectionOptions {
   /**
    * Require every non-identity field of an object schema to declare a
    * `.default(...)`, checked once when the collection is created.
-   * Defaults to `true`. Identity fields — the id field and `ref()` foreign keys
-   * — are the documented exception, and a non-object schema is skipped.
+   * Defaults to `true`. Identity fields — the id field and `ref()` foreign keys,
+   * including a `ref()` under `.nullable()`, `.optional()` or `.describe()` —
+   * are the documented exception.
+   *
+   * The object is found through the wrappers that keep one underneath
+   * (`.transform()`, `.pipe()`, `.brand()`, `.default()`, `z.lazy()`), and a
+   * schema that declares no fields at all (`z.string()`, `z.record()`) is
+   * skipped. A schema whose fields are *not one readable shape* — a union of
+   * object schemas, an intersection — is refused instead of skipped, because
+   * skipping it would report a check that never ran; passing `false` here is
+   * what accepts it, and it takes the rule off every field of the collection.
    */
   enforceDefaults?: boolean;
   /**
@@ -184,21 +194,22 @@ function assertIdentifier(value: string, role: string): void {
  * set for the same reason — prose that names the keys drifts where the list no
  * longer can.
  *
- * Reaches as far as the schema's shape is readable, which is a plain object
- * schema and the wrappers that keep a `.shape` (`.refine()`, `.brand()`). A
- * schema with no readable shape — `.transform()`, `.pipe()`, a union — is not
- * walked and is not refused; the same limit applies to `assertDefaultsDeclared`
- * below, and closing it is one change to how this file reads a schema rather
- * than two guards patched separately — F020.
+ * The fields come from `readObjectShape`, so the guard reaches through the
+ * wrappers a caller may have put around the object — `.transform()`, `.pipe()`,
+ * `.brand()`, `.default()` — rather than seeing no `.shape` and enforcing
+ * nothing (F020). What remains outside its reach is a schema whose fields are
+ * not one shape at all: a union of object schemas, an intersection.
+ * `assertDefaultsDeclared` refuses those outright, so one only reaches a
+ * collection under `{ enforceDefaults: false }` — where the caller has taken
+ * the schema's field names on themselves.
  */
 function assertNoReservedFieldNames(
   schema: z.ZodType,
   collectionName: string,
   idField: string,
 ): void {
-  const shape = (schema as { shape?: Record<string, z.ZodType> }).shape;
-  const fieldNames =
-    typeof shape === "object" && shape !== null ? Object.keys(shape) : [];
+  const reading = readObjectShape(schema);
+  const fieldNames = reading.kind === "declared" ? Object.keys(reading.shape) : [];
   for (const fieldName of [...fieldNames, idField]) {
     if (!RESERVED_WHERE_KEYS.has(fieldName)) continue;
     const reservedList = [...RESERVED_WHERE_KEYS].map((key) => `"${key}"`).join(", ");
@@ -374,7 +385,12 @@ const ELIDED_KEY = "<key>";
  * Only wrappers exposing an `innerType` are followed. `.transform()` and
  * `.pipe()` expose `in`/`out` instead and are deliberately left alone: past one
  * of those, what a value *is* no longer matches what the schema declares, so
- * "undeclared" is the honest answer — the F020 blind spot, kept fail-safe.
+ * "undeclared" is the honest answer for the elision below, and eliding is the
+ * fail-safe direction. That is the opposite of what the creation guards want,
+ * which is why `readObjectShape` in `src/schema-shape.ts` is a separate reader
+ * that does follow them — it wants the *declared* shape rather than the honest
+ * one. Pointing either at the other's callers would be wrong in both
+ * directions (F020).
  *
  * This matters because every non-identity field carries a `.default(...)`, so
  * without peeling, nothing nested would ever read as declared.
@@ -577,41 +593,52 @@ function describeIssues(issues: readonly ReportableIssue[], schema: unknown): st
 }
 
 /**
- * Whether a field supplies a value of its own when the key is absent. Asked of
- * the schema by parsing `undefined` rather than by reading Zod internals, so it
- * holds across Zod 3 and Zod 4 and across `.default()`, `.catch()`, and a
- * default carried through a `.transform()`. `.optional()` answers `undefined`
- * and is therefore *not* a default: `JSON.stringify` drops the key outright.
- */
-function hasDeclaredDefault(fieldSchema: z.ZodType): boolean {
-  const probe = fieldSchema.safeParse(undefined);
-  return probe.success && probe.data !== undefined;
-}
-
-/**
  * Enforce the default rule at collection creation: every non-identity field of
  * an object schema declares a default, so old rows read forward under an extended
  * schema and no field is silently dropped from storage. This library is the
  * only place that sees every schema that reaches storage, so it is the place
  * the rule is checked rather than merely documented.
+ *
+ * The fields come from `readObjectShape`, which follows the wrappers that keep
+ * an object underneath, so a `.transform()` on the schema no longer switches the
+ * rule off without saying so (F020).
+ *
+ * A schema whose fields are not one readable shape — a union of object schemas,
+ * an intersection — is **refused** rather than skipped. That is the deliberate
+ * half of F020: the two answers "this declares no fields" and "this declares
+ * fields I cannot read" used to be one, and enforcing nothing on the second is a
+ * rule that reports a check it never performed. `{ enforceDefaults: false }` is
+ * the way past it, which makes the exception a caller's decision rather than an
+ * accident of how the schema was spelled.
  */
 function assertDefaultsDeclared(
   schema: z.ZodType,
   collectionName: string,
   idField: string,
 ): void {
-  const shape = (schema as { shape?: Record<string, z.ZodType> }).shape;
-  // A non-object schema has no fields to walk — nothing to enforce.
-  if (typeof shape !== "object" || shape === null) return;
+  const reading = readObjectShape(schema);
+  if (reading.kind === "opaque") {
+    throw new Error(
+      `Collection "${collectionName}": the schema's fields cannot be read as one ` +
+        `shape, so the declared-default rule cannot be enforced on it — a union or an ` +
+        `intersection of object schemas declares fields, but not as one shape. Give the ` +
+        `collection a single object schema (the wrappers around one — .transform(), ` +
+        `.pipe(), .brand(), .default() — are followed), or pass ` +
+        `{ enforceDefaults: false } to take the schema's fields on yourself.`,
+    );
+  }
+  // A schema that declares no fields at all has nothing to enforce.
+  if (reading.kind === "none") return;
 
-  for (const [fieldName, fieldSchema] of Object.entries(shape)) {
+  for (const [fieldName, fieldSchema] of Object.entries(reading.shape)) {
     if (fieldName === idField || isReference(fieldSchema)) continue;
     if (hasDeclaredDefault(fieldSchema)) continue;
     throw new Error(
       `Collection "${collectionName}": field "${fieldName}" has no default. Every ` +
         `non-identity field must declare .default(...) so old rows read forward under ` +
         `an extended schema, or the field is dropped from storage entirely. Identity ` +
-        `fields (the id field and ref() foreign keys) are the documented exception; pass ` +
+        `fields are the documented exception — the id field, and a ref() foreign key ` +
+        `whether or not it is wrapped in .nullable(), .optional() or .describe(); pass ` +
         `{ enforceDefaults: false } to opt out.`,
     );
   }
