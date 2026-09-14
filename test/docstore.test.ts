@@ -2694,7 +2694,10 @@ describe("the confidentiality guard", () => {
 
   // Exactly the paths that are candidates to travel to a public repository.
   // `AGENTS.md`, `docs/` and `mise.local.toml` are private and stay private, so
-  // they keep their citations and are deliberately not scanned.
+  // they keep their citations and are deliberately not scanned. The published
+  // repository writes an `AGENTS.md` of its own — a different file, about a tree
+  // that has an issue tracker rather than a register — and it is not this one
+  // travelling under the same name.
   //
   // `.github/` and `.mise.toml` travel: the workflow runs `ci`, which is defined
   // in `.mise.toml` and is the whole of the gate downstream. The tasks that only
@@ -2802,12 +2805,18 @@ describe("the confidentiality guard", () => {
     // and it is also the shape of every guard that has ever quietly died: a
     // control that evaporates when its input goes missing passes forever.
     //
-    // The distinguishing fact is the same one the AGENTS.md and .npmignore
-    // guards use: a published tree is missing the *whole* private surface. This
-    // file being gone on its own is a deletion, and fails here.
+    // The distinguishing fact is the same one the .npmignore guard uses: a
+    // published tree is missing the *whole* private surface. This file being
+    // gone on its own is a deletion, and fails here.
+    //
+    // `AGENTS.md` was the second signal until the published repository grew one
+    // of its own — a file written there, about an issue tracker, which never
+    // travels in either direction. Its absence stopped meaning "published", so
+    // `mise.local.toml` carries that half now: it is the private task set, it is
+    // out of the travelling list above, and no published checkout has one.
     if (privateVocabulary === undefined) {
       expect(existsSync(join(repositoryRoot, "docs"))).toBe(false);
-      expect(existsSync(join(repositoryRoot, "AGENTS.md"))).toBe(false);
+      expect(existsSync(join(repositoryRoot, "mise.local.toml"))).toBe(false);
       return;
     }
 
@@ -2948,11 +2957,12 @@ describe("the confidentiality guard", () => {
     // once (F038). Both sides are read rather than hard-coded, so the next
     // relicensing cannot leave one of them behind either.
     //
-    // This test also runs in the published checkout, where AGENTS.md is absent
-    // by design — so absence has to be allowed without becoming the F036 hole,
-    // where a guard evaporates the moment its input goes missing. The
-    // distinguishing fact is that a published tree is missing the *whole*
-    // private surface: AGENTS.md alone being gone is a deletion, and fails.
+    // This test also runs in the published checkout, which now has an AGENTS.md
+    // of its own — so the licence assertions below cover both files, each in its
+    // own repository, and neither is copied from the other. Absence is still
+    // allowed rather than asserted, because a checkout with no private register
+    // beside it is a published one; but absence beside a register is a deletion,
+    // and that is the F036 hole this branch exists to keep closed.
     const read = (path: string): string | undefined => {
       try {
         return readFileSync(join(repositoryRoot, path), "utf8");
