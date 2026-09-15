@@ -90,14 +90,37 @@ function describeOperand(operand: unknown): string {
   return typeof operand;
 }
 
-/** Read a `contains`/`startsWith`/`endsWith` operand, which must be a string. */
-function readPatternOperand(operator: string, operand: unknown): string {
+/**
+ * Read a LIKE-family operand, which must be the `string` `FieldOperators`
+ * declares — a pattern is text, and nothing else denotes one (#16).
+ *
+ * `LIKE NULL` is `NULL` for every row, and a number binds as a number SQLite
+ * then coerces to text before matching, so an operand of either type compiled to
+ * a filter that answered nothing and said nothing about why — an empty answer
+ * indistinguishable from a truthful "no rows". `like` is declared `?: string`,
+ * so the `null` an HTTP layer forwards reaches it without a cast; the three
+ * escaped operators refused it here from the start, and `like` now refuses it
+ * the same way rather than being the family's one counterexample.
+ *
+ * Returned verbatim: `like` is the raw escape hatch, where the caller's own
+ * wildcards are the point. {@link readPatternOperand} is the escaping reader the
+ * other three take.
+ */
+function readLikeOperand(operator: string, operand: unknown): string {
   if (typeof operand !== "string") {
     throw new Error(
       `Operator "${operator}" expects a string operand, got ${describeOperand(operand)}`,
     );
   }
-  return escapeLikeOperand(operand);
+  return operand;
+}
+
+/**
+ * Read a `contains`/`startsWith`/`endsWith` operand, which must be a string, and
+ * neutralise the wildcards in it so the pattern matches literally.
+ */
+function readPatternOperand(operator: string, operand: unknown): string {
+  return escapeLikeOperand(readLikeOperand(operator, operand));
 }
 
 /**
@@ -153,6 +176,13 @@ function readListOperand(operator: string, operand: unknown): readonly unknown[]
  * path is validated against a strict identifier pattern so it can be embedded in
  * the SQL string without opening an injection vector — values always travel as
  * bound parameters, never field names.
+ *
+ * The text this returns is load-bearing beyond the statement it lands in: an
+ * expression index stores it verbatim in `sqlite_master`, and reopening a
+ * collection compares this output against what an existing file already holds
+ * (`resolveIndexes` in `src/collection.ts`). Whitespace is normalised on both
+ * sides of that compare, but changing the expression's shape changes what every
+ * stored index says it is.
  */
 export function jsonExtract(fieldPath: string): string {
   if (!FIELD_PATH_PATTERN.test(fieldPath)) {
@@ -437,9 +467,11 @@ function compileOperator(
     }
     case "like":
       // The raw escape hatch: the operand's own wildcards are the point. The
-      // ESCAPE clause is what lets an expert opt one out with a backslash.
+      // ESCAPE clause is what lets an expert opt one out with a backslash. The
+      // operand is still read as a pattern first (#16) — a raw pattern is raw
+      // text, not an absent one.
       conditions.push(`${expression} LIKE ? ${LIKE_ESCAPE_CLAUSE}`);
-      parameters.push(toSqlParameter(operand, `operator "${operator}"`));
+      parameters.push(readLikeOperand(operator, operand));
       return;
     case "contains":
     case "startsWith":

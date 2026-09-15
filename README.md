@@ -116,9 +116,11 @@ operator or field at fault.
 filter that quietly matches nothing reads exactly like a truthful "no rows", so the
 operand is named instead: `NaN` (which is what `Number(badQueryParam)` produces, and which
 binds as SQL `NULL`), a non-boolean `isNull` (`"false"` is what `?isNull=false` yields
-before anything parses it, and it used to select the rows it was written to exclude), and
-a `null` operand to `gt`/`gte`/`lt`/`lte` (a range comparison against no value has no
-answer — `isNull` or `eq: null` is the spelling that does). `Infinity` and `-Infinity`
+before anything parses it, and it used to select the rows it was written to exclude), a
+`null` operand to `gt`/`gte`/`lt`/`lte` (a range comparison against no value has no
+answer — `isNull` or `eq: null` is the spelling that does), and a non-string operand to
+`contains`/`startsWith`/`endsWith`/`like` (a pattern is text; `LIKE NULL` is `NULL` for
+every row). `Infinity` and `-Infinity`
 pass: they bind as numbers and order against every stored value, so `{ age: { lt:
 Infinity } }` is the "any number" filter it looks like.
 
@@ -268,6 +270,33 @@ places.find({
 The three-level bound is a compile-time budget, not a runtime one: deeper paths still
 work through `compileWhere`/`jsonExtract` directly, they are simply not offered by the
 typed surface, where unbounded recursion would blow TypeScript's instantiation limit.
+
+### Index names and redefinition
+
+An index is named after its field list alone — `idx_<table>_<fields>`, with a literal
+`_` doubled, a `.` written `_dot_` and `_and_` between two fields, so no two field lists
+can produce one name. `["status"]` is `idx_notes_status`; `["address.city"]` is
+`idx_places_address_dot_city`. The name is a pure function of the fields, so reopening a
+collection with a declaration it already carries creates nothing. An index name is
+scoped to the database rather than to one table, so on the rare shapes where two
+collections derive onto the same name the open throws instead of quietly creating
+nothing.
+
+`unique` is deliberately not part of the name, so declaring the same fields once
+non-unique and once unique is a **redefinition, and it throws**:
+
+```ts
+store.collection("things", schema, { indexes: ["email"] });
+store.collection("things", schema, { indexes: [{ fields: ["email"], unique: true }] });
+// throws: index "idx_things_email" over (email) already exists as a non-unique index …
+//         Run DROP INDEX "main"."idx_things_email" and reopen if the change is intended.
+```
+
+Dropping a UNIQUE index takes away a constraint the application may still believe it
+has, and adding one can fail against rows already stored; neither is decided quietly on
+the caller's behalf. An index a version up to `0.4.2` wrote under the older, lossy name
+is adopted on the next open — recreated under the current name, then dropped — so an
+existing file ends up with one index per declaration and no migration to run.
 
 ### `OR` and `NOT`
 
@@ -540,8 +569,24 @@ store.collection("ks", z.object({ slug: ref("k") }), { idField: "slug" });
 ```
 
 The check is case-insensitive, because SQLite identifiers are — `"KS"` and `"ks"` are one
-table and so one binding. It is also **in-process only**: the binding lives in memory, so
-a second connection to the same file does not yet see it (tracked as F018).
+table and so one binding.
+
+It **survives a close**. The binding a handle records lives in memory, so a second
+connection — a redeployed process opening a file that already holds rows — starts without
+it; the convention is therefore also read back off the rows themselves, because every
+write stores the id column as `document[idField]`. A reopen whose `idField` is not what a
+stored row is keyed by is refused the same way, naming the field the rows carry:
+
+```ts
+// a fresh process, on a file the snippet above wrote
+store.collection("ks", z.object({ slug: ref("k") }), { idField: "slug" });
+// throws: collection("ks"): stored rows are keyed by idField "id", cannot reopen with "slug".
+```
+
+Nothing of this library's is written to the file to make that work — there is no metadata
+table — so the guard answers on files that already exist, and on exactly the evidence the
+rows carry. An **empty** table carries none, so there the in-process binding is the whole
+of the check.
 
 That rule is **enforced, not documented**: `store.collection(...)` walks an object
 schema at creation and refuses a non-identity field with no `.default(...)`,
