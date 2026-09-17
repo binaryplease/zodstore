@@ -9,7 +9,7 @@ was nothing to name, so "which docstore is this?" could only be answered by
 diffing trees (F008). Releases from `0.4.2` on are published to npm as
 `@binaryplease/zodstore`.
 
-## Unreleased
+## 0.5.0 — 2026-09-17
 
 ### Fixed
 
