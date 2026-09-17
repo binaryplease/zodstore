@@ -1,6 +1,6 @@
 {
   "name": "@binaryplease/zodstore",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "type": "module",
   "description": "Native SQLite + Zod document-store library for Bun",
   "keywords": [
